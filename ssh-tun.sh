@@ -1,36 +1,39 @@
 #!/usr/bin/env bash
-# ssh_socks_farm_installer_v4.sh
-# Create & supervise multiple SSH dynamic SOCKS tunnels (one per port), optionally CPU-pinned,
-# with robust key installation that NEVER drops into an interactive remote shell.
 set -euo pipefail
 
-VERSION="v6"
+VERSION="v8"
+SCRIPT_PATH="$(readlink -f "$0")"
 
-# ----------------------------- helpers -----------------------------
-log()  { echo -e "[INFO] $*"; }
-ok()   { echo -e "[OK] $*"; }
-warn() { echo -e "[WARN] $*" >&2; }
-err()  { echo -e "[ERR] $*" >&2; }
+APP_NAME="ssh-tun"
+BIN_PATH="/usr/local/bin/ssh-tun"
+BASE_DIR="/etc/ssh-tun"
+PROFILES_DIR="${BASE_DIR}/profiles"
+LIBEXEC_DIR="/usr/local/libexec/ssh-tun"
+SUPERVISOR_PATH="${LIBEXEC_DIR}/supervisor.sh"
+SYSTEMD_TEMPLATE="/etc/systemd/system/ssh-tun@.service"
+LEGACY_ENV_FILE="/etc/ssh-socks-farm.env"
 
-die() { err "$*"; exit 1; }
+ROOT_HOME="$(getent passwd root 2>/dev/null | cut -d: -f6)"
+ROOT_HOME="${ROOT_HOME:-/root}"
+ROOT_SSH_DIR="${ROOT_HOME}/.ssh"
+KNOWN_HOSTS_FILE_DEFAULT="${ROOT_SSH_DIR}/known_hosts"
+SSH_CONFIG_FILE="${ROOT_SSH_DIR}/config"
 
-need_root() {
-  if [[ "${EUID:-0}" -ne 0 ]]; then
-    die "Run as root (sudo -i)."
-  fi
-}
+PREREQ_PKGS=(openssh-client curl iproute2 ca-certificates)
+
+log()  { echo "[INFO] $*"; }
+ok()   { echo "[OK] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERR] $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+hr() { printf '%s\n' "------------------------------------------------------------"; }
+section() { echo; hr; echo "$1"; hr; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-install_pkgs() {
-  local pkgs=("$@")
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y "${pkgs[@]}"
-}
+need_root() { [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo -i)."; }
 
 prompt_default() {
-  # usage: prompt_default "Question" "default" varname
   local q="$1" def="$2" __var="$3"
   local ans
   read -r -p "$q [$def]: " ans || true
@@ -39,7 +42,6 @@ prompt_default() {
 }
 
 prompt_yesno() {
-  # usage: prompt_yesno "Question" "YES|NO" varname
   local q="$1" def="$2" __var="$3"
   local def_lc ans
   def_lc="$(echo "$def" | tr '[:upper:]' '[:lower:]')"
@@ -50,11 +52,41 @@ prompt_yesno() {
     case "$ans" in
       yes) printf -v "$__var" "YES"; return 0 ;;
       no)  printf -v "$__var" "NO"; return 0 ;;
-      "")  warn "Please type yes or no."; ;;
-      *)   warn "Invalid answer. Type yes or no."; ;;
+      "")  printf -v "$__var" "%s" "$(echo "$def_lc" | tr '[:lower:]' '[:upper:]')"; return 0 ;;
+      *)   warn "Invalid answer. Type yes or no." ;;
     esac
   done
 }
+
+prompt_cipher_choice() {
+  local __var="$1"
+  local -a choices=(
+    "chacha20-poly1305@openssh.com"
+    "aes128-gcm@openssh.com"
+    "aes256-gcm@openssh.com"
+    "aes128-ctr"
+    "aes256-ctr"
+  )
+  local default_idx=1 ans idx
+  echo "SSH cipher options:"
+  echo "  1) ${choices[0]} (default)"
+  echo "  2) ${choices[1]}"
+  echo "  3) ${choices[2]}"
+  echo "  4) ${choices[3]}"
+  echo "  5) ${choices[4]}"
+  while true; do
+    read -r -p "Choose cipher number [${default_idx}]: " ans || true
+    ans="${ans:-$default_idx}"
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#choices[@]} )); then
+      idx=$((ans - 1))
+      printf -v "$__var" "%s" "${choices[$idx]}"
+      return 0
+    fi
+    warn "Invalid choice. Enter a number between 1 and ${#choices[@]}."
+  done
+}
+
+is_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= $1 && $1 <= 65535)); }
 
 is_local_port_free() {
   local p="$1"
@@ -75,91 +107,21 @@ show_port_conflict() {
   fi
 }
 
-hr() {
-  printf '%s\n' "------------------------------------------------------------"
-}
-
-section() {
-  echo
-  hr
-  echo "$1"
-  hr
-}
-
-prompt_cipher_choice() {
-  # usage: prompt_cipher_choice varname
-  local __var="$1"
-  local -a choices=(
-    "chacha20-poly1305@openssh.com"
-    "aes128-gcm@openssh.com"
-    "aes256-gcm@openssh.com"
-    "aes128-ctr"
-    "aes256-ctr"
-  )
-  local default_idx=1 ans idx
-
-  echo
-  echo "SSH cipher options:"
-  echo "  1) ${choices[0]} (default)"
-  echo "  2) ${choices[1]}"
-  echo "  3) ${choices[2]}"
-  echo "  4) ${choices[3]}"
-  echo "  5) ${choices[4]}"
-
-  while true; do
-    read -r -p "Choose cipher number [${default_idx}]: " ans || true
-    ans="${ans:-$default_idx}"
-    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#choices[@]} )); then
-      idx=$((ans - 1))
-      printf -v "$__var" "%s" "${choices[$idx]}"
-      return 0
-    fi
-    warn "Invalid choice. Enter a number between 1 and ${#choices[@]}."
-  done
-}
-
-base64_nowrap() {
-  # Portable-ish base64 no-wrap.
-  # usage: base64_nowrap [file]
-  local input="${1:-}"
-  if base64 --help 2>/dev/null | grep -q -- '-w'; then
-    if [[ -n "$input" ]]; then
-      base64 -w0 "$input"
-    else
-      base64 -w0
-    fi
-  else
-    if [[ -n "$input" ]]; then
-      base64 "$input" | tr -d '\n'
-    else
-      base64 | tr -d '\n'
-    fi
-  fi
-}
-
-is_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= $1 && $1 <= 65535))
-}
-
 parse_ports_spec() {
-  # Accept: "100-150" or "101,104,105" or mix "4040,1660-1665,1667"
-  # Prints one port per line (unique, sorted numeric).
   local spec="$1"
   spec="${spec// /}"
   [[ -n "$spec" ]] || return 1
-  local tmp out
+  local tmp out part
   tmp="$(mktemp)"
   out="$(mktemp)"
   IFS=',' read -r -a parts <<< "$spec"
   for part in "${parts[@]}"; do
     [[ -n "$part" ]] || continue
     if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+      local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" p t
       is_port "$a" || { rm -f "$tmp" "$out"; return 2; }
       is_port "$b" || { rm -f "$tmp" "$out"; return 2; }
-      if (( a > b )); then
-        local t="$a"; a="$b"; b="$t"
-      fi
+      if (( a > b )); then t="$a"; a="$b"; b="$t"; fi
       for ((p=a; p<=b; p++)); do echo "$p" >>"$tmp"; done
     else
       is_port "$part" || { rm -f "$tmp" "$out"; return 2; }
@@ -171,271 +133,134 @@ parse_ports_spec() {
   rm -f "$tmp" "$out"
 }
 
-safe_host_tag() {
-  # safe for filenames/paths; locale-safe to avoid tr range issues
-  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._:-' '_' | sed 's/_\+/_/g'
+safe_tag() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/_\+/_/g'; }
+profile_env_path() { printf '%s/%s.env' "$PROFILES_DIR" "$1"; }
+profile_state_path() { printf '%s/%s.instances' "$PROFILES_DIR" "$1"; }
+
+ensure_dirs() {
+  mkdir -p "$PROFILES_DIR" "$LIBEXEC_DIR" "$ROOT_SSH_DIR"
+  chmod 700 "$ROOT_SSH_DIR"
+  touch "$KNOWN_HOSTS_FILE_DEFAULT" "$SSH_CONFIG_FILE"
+  chmod 600 "$KNOWN_HOSTS_FILE_DEFAULT" "$SSH_CONFIG_FILE" || true
 }
 
-safe_alias_tag() {
-  # safe for SSH Host alias in ~/.ssh/config
-  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/_\+/_/g'
+ensure_apt() {
+  have_cmd apt-get || die "Only Debian/Ubuntu (apt-get) is supported."
 }
 
-systemd_reload() {
-  systemctl daemon-reload
+pkg_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
-# ----------------------------- SSH key install (non-interactive) -----------------------------
-ssh_pw_opts() {
-  # Options that force password-style auth and prevent agent/pubkey attempts.
-  # Include keyboard-interactive because many servers expose password via PAM challenge.
-  # Printed as words (for array usage).
-  cat <<'OPTS'
--o PubkeyAuthentication=no
--o PreferredAuthentications=keyboard-interactive,password
--o KbdInteractiveAuthentication=yes
--o IdentitiesOnly=yes
--o IdentityFile=/dev/null
--o RequestTTY=no
--o LogLevel=ERROR
--o StrictHostKeyChecking=accept-new
--o UserKnownHostsFile=/root/.ssh/known_hosts
--o ConnectTimeout=10
-OPTS
-}
-
-ssh_key_opts() {
-  # Options for KEY auth (BatchMode=yes should be set by caller when testing).
-  cat <<'OPTS'
--o IdentitiesOnly=yes
--o LogLevel=ERROR
--o StrictHostKeyChecking=accept-new
--o UserKnownHostsFile=/root/.ssh/known_hosts
--o ConnectTimeout=10
-OPTS
-}
-
-ssh_common_opts() {
-  # Common non-auth SSH options.
-  cat <<'OPTS'
--o LogLevel=ERROR
--o StrictHostKeyChecking=accept-new
--o UserKnownHostsFile=/root/.ssh/known_hosts
--o ConnectTimeout=10
-OPTS
-}
-
-remote_password_probe() {
-  local user="$1" host="$2" port="$3"
-  local -a pw_opts
-  mapfile -t pw_opts < <(ssh_pw_opts)
-  # This is an interactive probe (you will type password in ssh prompt).
-  ssh -F /dev/null -T -o RequestTTY=no -p "$port" \
-    "${pw_opts[@]}" \
-    "${user}@${host}" "true"
-}
-
-remote_install_pubkey_via_password() {
-  local user="$1" host="$2" port="$3" pubkey_path="$4"
-  local -a pw_opts common_opts
-  mapfile -t pw_opts < <(ssh_pw_opts)
-  mapfile -t common_opts < <(ssh_common_opts)
-  [[ -r "$pubkey_path" ]] || return 1
-
-  local pub_b64 tmpdir sock rc remote_cmd
-  pub_b64="$(base64_nowrap "$pubkey_path")"
-  [[ -n "$pub_b64" ]] || return 1
-  tmpdir="$(mktemp -d /tmp/sshcm.XXXXXX)"
-  sock="$tmpdir/cm.sock"
-  rc=1
-  remote_cmd="PUB_B64='$pub_b64' bash -c 'set -euo pipefail
-umask 077
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-if pub=\$(printf \"%s\" \"\$PUB_B64\" | base64 -d 2>/dev/null); then
-  true
-else
-  pub=\$(printf \"%s\" \"\$PUB_B64\" | base64 --decode)
-fi
-
-[[ -n \"\$pub\" ]] || { echo \"[ERR] decoded pubkey is empty\"; exit 1; }
-
-if grep -qxF \"\$pub\" ~/.ssh/authorized_keys; then
-  echo \"[OK] Key already present.\"
-else
-  echo \"\$pub\" >> ~/.ssh/authorized_keys
-  echo \"[OK] Key appended.\"
-fi
-'"
-
-  # 1) Establish a short-lived multiplex master using password ONCE.
-  #    (You will type the password in the ssh prompt.)
-  if ssh -F /dev/null -fN -p "$port" -T -o RequestTTY=no \
-      -o ControlMaster=yes -o ControlPath="$sock" -o ControlPersist=60 \
-      "${pw_opts[@]}" \
-      "${user}@${host}"; then
-    # 2) Run the remote install through the master; -n ensures we never drop into an interactive shell.
-    #    Also avoid login shells (-l) so remote profile scripts can't hijack the session.
-    if ssh -F /dev/null -n -T -o RequestTTY=no -p "$port" \
-        -o ControlMaster=auto -o ControlPath="$sock" \
-        "${common_opts[@]}" \
-        "${user}@${host}" \
-        "$remote_cmd"; then
-      rc=0
+show_prereq_table() {
+  section "Prerequisites"
+  local pkg mark
+  for pkg in "${PREREQ_PKGS[@]}"; do
+    if pkg_installed "$pkg"; then
+      mark="[INSTALLED]"
+    else
+      mark="[MISSING]"
     fi
-    # Close master.
-    ssh -F /dev/null -p "$port" -o ControlPath="$sock" -O exit "${user}@${host}" >/dev/null 2>&1 || true
-  fi
+    printf "  %s %s\n" "$mark" "$pkg"
+  done
+}
 
-  # Fallback: if ControlMaster path failed for any reason, do direct password command once.
-  if (( rc != 0 )); then
-    if ssh -F /dev/null -T -o RequestTTY=no -p "$port" \
-        "${pw_opts[@]}" \
-        "${user}@${host}" \
-        "$remote_cmd"; then
-      rc=0
+install_prereqs_interactive() {
+  ensure_apt
+  local missing=() installed=() pkg ask_upgrade
+  for pkg in "${PREREQ_PKGS[@]}"; do
+    if pkg_installed "$pkg"; then
+      installed+=("$pkg")
+    else
+      missing+=("$pkg")
     fi
-  fi
+  done
 
-  rm -rf "$tmpdir"
-  return "$rc"
-}
-
-remote_test_key() {
-  local user="$1" host="$2" port="$3" key_path="$4"
-  local -a key_opts
-  mapfile -t key_opts < <(ssh_key_opts)
-  ssh -F /dev/null -T -p "$port" -i "$key_path" -o BatchMode=yes "${key_opts[@]}" "${user}@${host}" "true"
-}
-
-# ----------------------------- tuning (local/remote optional) -----------------------------
-apply_local_tuning() {
-  # Conservative tuning for many local sockets (SOCKS listeners, many conns).
-  # Does NOT change congestion control here.
-  cat >/etc/sysctl.d/99-ssh-socks-farm.conf <<'EOF'
-# ssh socks farm tuning (conservative)
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 6
-EOF
-  sysctl --system >/dev/null
-  ok "Applied local sysctl tuning (/etc/sysctl.d/99-ssh-socks-farm.conf)."
-}
-
-apply_remote_tuning() {
-  local user="$1" host="$2" port="$3" key_path="$4"
-  local -a key_opts
-  mapfile -t key_opts < <(ssh_key_opts)
-  # Use KEY auth; if it fails, we skip.
-  if ! remote_test_key "$user" "$host" "$port" "$key_path" >/dev/null 2>&1; then
-    warn "Remote tuning skipped: key auth not working yet."
+  if (( ${#missing[@]} == 0 )); then
+    ok "All prerequisites are already installed."
+    prompt_yesno "Do you want to run package upgrades for installed prerequisites?" "NO" ask_upgrade
+    if [[ "$ask_upgrade" == "YES" ]]; then
+      apt-get update -y >/dev/null
+      apt-get install --only-upgrade -y "${installed[@]}"
+      ok "Requested upgrades applied."
+    else
+      log "Upgrade skipped."
+    fi
     return 0
   fi
 
-  ssh -F /dev/null -T -p "$port" -i "$key_path" -o BatchMode=yes "${key_opts[@]}" "${user}@${host}" \
-    "bash -lc 'set -euo pipefail
-      echo \"[INFO] Applying remote sysctl tuning...\"
-      cat >/etc/sysctl.d/99-ssh-socks-farm.conf <<\"EOF\"
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_mtu_probing = 1
-EOF
-      sysctl --system >/dev/null || true
+  log "Missing packages: ${missing[*]}"
+  apt-get update -y >/dev/null
+  apt-get install -y "${missing[@]}"
+  ok "Missing prerequisites installed."
 
-      echo \"[INFO] Applying sshd tuning drop-in...\"
-      mkdir -p /etc/ssh/sshd_config.d
-      cat >/etc/ssh/sshd_config.d/99-ssh-socks-farm.conf <<\"EOF\"
-# ssh socks farm tuning
-ClientAliveInterval 30
-ClientAliveCountMax 3
-TCPKeepAlive yes
-MaxSessions 1024
-# MaxStartups: start:rate:full
-MaxStartups 2000:30:2000
-EOF
-
-      if systemctl is-active --quiet ssh; then
-        systemctl reload ssh || systemctl restart ssh
-      elif systemctl is-active --quiet sshd; then
-        systemctl reload sshd || systemctl restart sshd
-      fi
-      echo \"[OK] Remote tuning done.\"
-    '"
+  if (( ${#installed[@]} > 0 )); then
+    prompt_yesno "Upgrade already-installed prerequisite packages as well?" "NO" ask_upgrade
+    if [[ "$ask_upgrade" == "YES" ]]; then
+      apt-get install --only-upgrade -y "${installed[@]}"
+      ok "Requested upgrades applied."
+    fi
+  fi
 }
 
-# ----------------------------- systemd + supervisor -----------------------------
 write_supervisor() {
-  cat >/usr/local/bin/ssh_socks_farm_supervisor.sh <<'EOS'
+  cat >"$SUPERVISOR_PATH" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_BASE_DIR="/etc/ssh-socks-farm"
-LEGACY_ENV_FILE="/etc/ssh-socks-farm.env"
+BASE_DIR="/etc/ssh-tun"
+PROFILES_DIR="${BASE_DIR}/profiles"
+ROOT_HOME="$(getent passwd root 2>/dev/null | cut -d: -f6)"
+ROOT_HOME="${ROOT_HOME:-/root}"
 
-log()  { echo -e "$(date -Is) [INFO] $*"; }
-warn() { echo -e "$(date -Is) [WARN] $*" >&2; }
+log()  { echo "$(date -Is) [INFO] $*"; }
+warn() { echo "$(date -Is) [WARN] $*" >&2; }
 
 INSTANCE_RAW="${1:-}"
 [[ -n "$INSTANCE_RAW" ]] || { echo "[ERR] Missing instance id"; exit 1; }
 
-PROFILE_ID="default"
-INSTANCE="$INSTANCE_RAW"
-if [[ "$INSTANCE_RAW" == *"__"* ]]; then
-  PROFILE_ID="${INSTANCE_RAW%%__*}"
-  INSTANCE="${INSTANCE_RAW#*__}"
+PROFILE_ID="${INSTANCE_RAW%%__*}"
+INSTANCE="${INSTANCE_RAW#*__}"
+if [[ "$PROFILE_ID" == "$INSTANCE_RAW" ]]; then
+  echo "[ERR] Invalid instance id: $INSTANCE_RAW"
+  exit 1
 fi
 
-ENV_FILE="${ENV_BASE_DIR}/${PROFILE_ID}.env"
-if [[ ! -r "$ENV_FILE" ]]; then
-  if [[ -r "$LEGACY_ENV_FILE" ]]; then
-    ENV_FILE="$LEGACY_ENV_FILE"
-  else
-    echo "[ERR] Missing $ENV_FILE"
-    exit 1
-  fi
-fi
+ENV_FILE="${PROFILES_DIR}/${PROFILE_ID}.env"
+[[ -r "$ENV_FILE" ]] || { echo "[ERR] Missing profile env: $ENV_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
 CORE=""
-SOCKS_PORT=""
-
+SOCKS_PORT="$INSTANCE"
 if [[ "$INSTANCE" == *"-"* ]]; then
   CORE="${INSTANCE%%-*}"
   SOCKS_PORT="${INSTANCE##*-}"
-else
-  SOCKS_PORT="$INSTANCE"
 fi
-
-if ! [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]]; then
-  echo "[ERR] Bad port in instance: $INSTANCE"
-  exit 1
-fi
+[[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] || { echo "[ERR] Bad port in instance: $INSTANCE"; exit 1; }
 
 PINNING="${PINNING:-NO}"
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+KNOWN_HOSTS_FILE="${KNOWN_HOSTS_FILE:-${ROOT_HOME}/.ssh/known_hosts}"
+mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
+touch "$KNOWN_HOSTS_FILE"
+chmod 600 "$KNOWN_HOSTS_FILE" || true
 
-# Health check target: Google generate_204 (HTTP 204)
-HC_URL="${HC_URL:-http://clients3.google.com/generate_204}"
+HC_URLS="${HC_URLS:-http://clients3.google.com/generate_204,http://connectivitycheck.gstatic.com/generate_204,http://www.msftconnecttest.com/connecttest.txt}"
 HC_TIMEOUT="${HC_TIMEOUT:-5}"
-HC_RETRIES="${HC_RETRIES:-3}"
+HC_RETRIES="${HC_RETRIES:-2}"
 HC_INTERVAL="${HC_INTERVAL:-15}"
 HC_FAILS_TO_RESTART="${HC_FAILS_TO_RESTART:-3}"
+HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-20}"
+DEBUG_HEALTHCHECK="${DEBUG_HEALTHCHECK:-NO}"
 
-SSH_BASE_OPTS=(
+SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
+SSH_OPTS=(
   -F /dev/null
   -N
   -D "${BIND_ADDR}:${SOCKS_PORT}"
+  -p "${REMOTE_PORT}"
+  -i "${KEY_PATH}"
   -o "IdentitiesOnly=yes"
   -o "Compression=no"
   -o "Ciphers=${CIPHERS}"
@@ -445,73 +270,73 @@ SSH_BASE_OPTS=(
   -o "ServerAliveCountMax=${SERVER_ALIVE_COUNTMAX}"
   -o "TCPKeepAlive=yes"
   -o "GSSAPIAuthentication=no"
-  -o "LogLevel=ERROR"
   -o "StrictHostKeyChecking=accept-new"
-  -o "UserKnownHostsFile=/root/.ssh/known_hosts"
+  -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
   -o "ConnectTimeout=10"
+  -o "BatchMode=yes"
+  -o "LogLevel=ERROR"
 )
-SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
-SSH_CONN_OPTS=(
-  -p "${REMOTE_PORT}"
-  -i "${KEY_PATH}"
-  -o "HostName=${REMOTE_HOST}"
-  -o "User=${REMOTE_USER}"
-)
-
-start_ssh() {
-  if [[ "$PINNING" == "YES" && "$CORE" =~ ^[0-9]+$ ]]; then
-    log "starting ssh (core=$CORE port=$SOCKS_PORT)"
-    exec taskset -c "$CORE" ssh "${SSH_CONN_OPTS[@]}" "${SSH_BASE_OPTS[@]}" "$SSH_TARGET"
-  else
-    log "starting ssh (port=$SOCKS_PORT)"
-    exec ssh "${SSH_CONN_OPTS[@]}" "${SSH_BASE_OPTS[@]}" "$SSH_TARGET"
-  fi
-}
 
 probe_socks_http() {
-  # Returns 0 if ok, 1 if fail.
-  # Use socks5h (hostname resolution through proxy) to be robust.
-  local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' \
-    --connect-timeout "$HC_TIMEOUT" --max-time "$HC_TIMEOUT" \
-    --retry "$HC_RETRIES" --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
-    --proxy "socks5h://${BIND_ADDR}:${SOCKS_PORT}" \
-    "$HC_URL" || true)"
+  local endpoint code
+  IFS=',' read -r -a endpoints <<< "$HC_URLS"
+  for endpoint in "${endpoints[@]}"; do
+    [[ -n "$endpoint" ]] || continue
+    code="$(curl -s -o /dev/null -w '%{http_code}' \
+      --connect-timeout "$HC_TIMEOUT" --max-time "$HC_TIMEOUT" \
+      --retry "$HC_RETRIES" --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
+      --proxy "socks5h://${BIND_ADDR}:${SOCKS_PORT}" \
+      "$endpoint" 2>/dev/null || true)"
 
-  # Accept 204 (generate_204) or 200.
-  [[ "$code" == "204" || "$code" == "200" ]]
+    if [[ "$code" == "204" || "$code" == "200" ]]; then
+      return 0
+    fi
+    if [[ "$DEBUG_HEALTHCHECK" == "YES" ]]; then
+      warn "HC endpoint failed: port=$SOCKS_PORT endpoint=$endpoint code=${code:-n/a}"
+    fi
+  done
+  return 1
 }
 
-# Supervisor loop:
-# - starts ssh
-# - periodically checks HTTP through SOCKS
-# - if consecutive failures >= threshold, kills ssh and restarts
+start_ssh_bg() {
+  if [[ "$PINNING" == "YES" && "$CORE" =~ ^[0-9]+$ ]]; then
+    taskset -c "$CORE" ssh "${SSH_OPTS[@]}" "$SSH_TARGET" &
+  else
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" &
+  fi
+  echo $!
+}
+
 FAILS=0
+HEARTBEAT_COUNT=0
+LAST_STATE="STARTING"
 
 while true; do
-  # Start ssh in background so we can supervise it.
-  if [[ "$PINNING" == "YES" && "$CORE" =~ ^[0-9]+$ ]]; then
-    taskset -c "$CORE" ssh "${SSH_CONN_OPTS[@]}" "${SSH_BASE_OPTS[@]}" "$SSH_TARGET" &
-  else
-    ssh "${SSH_CONN_OPTS[@]}" "${SSH_BASE_OPTS[@]}" "$SSH_TARGET" &
-  fi
-  SSH_PID=$!
+  SSH_PID="$(start_ssh_bg)"
   FAILS=0
-  log "ssh started pid=$SSH_PID"
-
-  # Give it a moment to bind.
+  HEARTBEAT_COUNT=0
+  LAST_STATE="UP"
+  log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID"
   sleep 1
 
   while kill -0 "$SSH_PID" >/dev/null 2>&1; do
     if probe_socks_http; then
       FAILS=0
+      HEARTBEAT_COUNT=$((HEARTBEAT_COUNT + 1))
+      if [[ "$LAST_STATE" != "UP" ]]; then
+        log "tunnel recovered: instance=$INSTANCE"
+        LAST_STATE="UP"
+      fi
+      if (( HEARTBEAT_COUNT % HEARTBEAT_EVERY == 0 )); then
+        log "tunnel alive: instance=$INSTANCE pid=$SSH_PID"
+      fi
     else
       FAILS=$((FAILS + 1))
-      warn "healthcheck failed ($FAILS/${HC_FAILS_TO_RESTART}) for port $SOCKS_PORT"
+      LAST_STATE="DEGRADED"
+      warn "healthcheck failed: instance=$INSTANCE (${FAILS}/${HC_FAILS_TO_RESTART})"
       if (( FAILS >= HC_FAILS_TO_RESTART )); then
-        warn "restarting ssh for port $SOCKS_PORT"
+        warn "healthcheck threshold reached; restarting instance=$INSTANCE"
         kill "$SSH_PID" >/dev/null 2>&1 || true
-        # wait a bit for cleanup
         sleep 1
         break
       fi
@@ -519,25 +344,122 @@ while true; do
     sleep "$HC_INTERVAL"
   done
 
-  # If ssh exited, restart.
   wait "$SSH_PID" >/dev/null 2>&1 || true
-  warn "ssh exited for port $SOCKS_PORT; restarting in 2s"
+  warn "ssh exited: instance=$INSTANCE; restart in 2s"
   sleep 2
 done
 EOS
-  chmod 0755 /usr/local/bin/ssh_socks_farm_supervisor.sh
-  ok "Wrote supervisor: /usr/local/bin/ssh_socks_farm_supervisor.sh"
+  chmod 0755 "$SUPERVISOR_PATH"
+}
+
+write_systemd_template() {
+  cat >"$SYSTEMD_TEMPLATE" <<EOF
+[Unit]
+Description=SSH Tunnel Supervisor (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SUPERVISOR_PATH} %i
+Restart=always
+RestartSec=2
+KillMode=process
+TimeoutStopSec=5
+LimitNOFILE=200000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+systemd_reload() {
+  systemctl daemon-reload
+}
+
+ssh_key_opts() {
+  local known_hosts="$1"
+  cat <<EOF
+-o IdentitiesOnly=yes
+-o LogLevel=ERROR
+-o StrictHostKeyChecking=accept-new
+-o UserKnownHostsFile=${known_hosts}
+-o ConnectTimeout=10
+EOF
+}
+
+ssh_pw_opts() {
+  local known_hosts="$1"
+  cat <<EOF
+-o PubkeyAuthentication=no
+-o PreferredAuthentications=keyboard-interactive,password
+-o KbdInteractiveAuthentication=yes
+-o IdentitiesOnly=yes
+-o IdentityFile=/dev/null
+-o RequestTTY=no
+-o LogLevel=ERROR
+-o StrictHostKeyChecking=accept-new
+-o UserKnownHostsFile=${known_hosts}
+-o ConnectTimeout=10
+EOF
+}
+
+remote_test_key() {
+  local user="$1" host="$2" port="$3" key_path="$4" known_hosts="$5"
+  local -a key_opts
+  mapfile -t key_opts < <(ssh_key_opts "$known_hosts")
+  ssh -F /dev/null -T -p "$port" -i "$key_path" -o BatchMode=yes "${key_opts[@]}" "${user}@${host}" "true"
+}
+
+remote_password_probe() {
+  local user="$1" host="$2" port="$3" known_hosts="$4"
+  local -a pw_opts
+  mapfile -t pw_opts < <(ssh_pw_opts "$known_hosts")
+  ssh -F /dev/null -T -o RequestTTY=no -p "$port" "${pw_opts[@]}" "${user}@${host}" "true"
+}
+
+base64_nowrap() {
+  local input="${1:-}"
+  if base64 --help 2>/dev/null | grep -q -- '-w'; then
+    [[ -n "$input" ]] && base64 -w0 "$input" || base64 -w0
+  else
+    [[ -n "$input" ]] && base64 "$input" | tr -d '\n' || base64 | tr -d '\n'
+  fi
+}
+
+remote_install_pubkey_via_password() {
+  local user="$1" host="$2" port="$3" pubkey_path="$4" known_hosts="$5"
+  local -a pw_opts
+  mapfile -t pw_opts < <(ssh_pw_opts "$known_hosts")
+  [[ -r "$pubkey_path" ]] || return 1
+
+  local pub_b64 remote_cmd
+  pub_b64="$(base64_nowrap "$pubkey_path")"
+  [[ -n "$pub_b64" ]] || return 1
+
+  remote_cmd="PUB_B64='$pub_b64' bash -c 'set -euo pipefail
+umask 077
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+pub=\$(printf \"%s\" \"\$PUB_B64\" | base64 -d 2>/dev/null || printf \"%s\" \"\$PUB_B64\" | base64 --decode)
+[[ -n \"\$pub\" ]] || exit 1
+grep -qxF \"\$pub\" ~/.ssh/authorized_keys || echo \"\$pub\" >> ~/.ssh/authorized_keys
+'"
+
+  ssh -F /dev/null -T -o RequestTTY=no -p "$port" "${pw_opts[@]}" "${user}@${host}" "$remote_cmd"
 }
 
 write_ssh_config_host() {
-  local alias="$1" remote_host="$2" remote_user="$3" remote_port="$4" key_path="$5"
-  local cfg="/root/.ssh/config"
-  local start_marker end_marker tmp
-  start_marker="# >>> ssh-socks-farm ${alias}"
-  end_marker="# <<< ssh-socks-farm ${alias}"
+  local alias="$1" remote_host="$2" remote_user="$3" remote_port="$4" key_path="$5" known_hosts="$6"
+  local cfg="$SSH_CONFIG_FILE"
+  local start_marker="# >>> ssh-tun ${alias}"
+  local end_marker="# <<< ssh-tun ${alias}"
+  local tmp
 
-  mkdir -p /root/.ssh
-  chmod 700 /root/.ssh
+  mkdir -p "$ROOT_SSH_DIR"
+  chmod 700 "$ROOT_SSH_DIR"
   touch "$cfg"
   chmod 600 "$cfg"
 
@@ -549,10 +471,7 @@ write_ssh_config_host() {
     drop == 0 { print }
   ' "$cfg" >"$tmp"
 
-  if [[ -s "$tmp" ]]; then
-    printf '\n' >>"$tmp"
-  fi
-
+  [[ -s "$tmp" ]] && printf '\n' >>"$tmp"
   cat >>"$tmp" <<EOF
 $start_marker
 Host $alias
@@ -562,91 +481,164 @@ Host $alias
   IdentityFile $key_path
   IdentitiesOnly yes
   StrictHostKeyChecking accept-new
-  UserKnownHostsFile /root/.ssh/known_hosts
+  UserKnownHostsFile $known_hosts
 $end_marker
 EOF
 
   mv "$tmp" "$cfg"
   chmod 600 "$cfg"
-  ok "Updated SSH config alias: ${alias} (${cfg})"
 }
 
-write_env_file() {
-  local remote_host="$1" remote_user="$2" remote_port="$3" key_path="$4" bind_addr="$5"
-  local ciphers="$6" rekey="$7"
-  local sa_int="$8" sa_cnt="$9"
-  local pinning="${10}"
-  local ssh_host_alias="${11:-}"
-  local profile_id="${12:-default}"
-  local env_dir="/etc/ssh-socks-farm"
-  local env_file="${env_dir}/${profile_id}.env"
+write_profile_env() {
+  local profile="$1" remote_host="$2" remote_port="$3" remote_user="$4" key_path="$5" bind_addr="$6"
+  local ports_csv="$7" pinning="$8" ciphers="$9" rekey="${10}" sa_int="${11}" sa_cnt="${12}"
+  local known_hosts="${13}" ssh_alias="${14}" profile_enabled="${15}" hc_urls="${16}" hc_timeout="${17}" hc_retries="${18}"
+  local hc_interval="${19}" hc_fails="${20}" heartbeat_every="${21}" debug_hc="${22}"
 
-  mkdir -p "$env_dir"
+  local env_file
+  env_file="$(profile_env_path "$profile")"
 
   {
-    printf 'PROFILE_ID=%q\n' "$profile_id"
+    printf 'PROFILE_NAME=%q\n' "$profile"
+    printf 'PROFILE_ENABLED=%q\n' "$profile_enabled"
     printf 'REMOTE_HOST=%q\n' "$remote_host"
-    printf 'REMOTE_USER=%q\n' "$remote_user"
     printf 'REMOTE_PORT=%q\n' "$remote_port"
+    printf 'REMOTE_USER=%q\n' "$remote_user"
     printf 'KEY_PATH=%q\n' "$key_path"
     printf 'BIND_ADDR=%q\n' "$bind_addr"
-    echo
+    printf 'PORT_SPEC=%q\n' "$ports_csv"
+    printf 'PINNING=%q\n' "$pinning"
     printf 'CIPHERS=%q\n' "$ciphers"
     printf 'REKEY_LIMIT=%q\n' "$rekey"
     printf 'SERVER_ALIVE_INTERVAL=%q\n' "$sa_int"
     printf 'SERVER_ALIVE_COUNTMAX=%q\n' "$sa_cnt"
-    echo
-    printf 'PINNING=%q\n' "$pinning"
-    printf 'SSH_HOST_ALIAS=%q\n' "$ssh_host_alias"
-    cat <<'EOF'
-
-# Health check settings (edit if needed)
-HC_URL=http://clients3.google.com/generate_204
-HC_TIMEOUT=5
-HC_RETRIES=3
-HC_INTERVAL=15
-HC_FAILS_TO_RESTART=3
-EOF
+    printf 'KNOWN_HOSTS_FILE=%q\n' "$known_hosts"
+    printf 'SSH_HOST_ALIAS=%q\n' "$ssh_alias"
+    printf 'HC_URLS=%q\n' "$hc_urls"
+    printf 'HC_TIMEOUT=%q\n' "$hc_timeout"
+    printf 'HC_RETRIES=%q\n' "$hc_retries"
+    printf 'HC_INTERVAL=%q\n' "$hc_interval"
+    printf 'HC_FAILS_TO_RESTART=%q\n' "$hc_fails"
+    printf 'HEARTBEAT_EVERY=%q\n' "$heartbeat_every"
+    printf 'DEBUG_HEALTHCHECK=%q\n' "$debug_hc"
   } >"$env_file"
+
   chmod 0644 "$env_file"
-  ok "Wrote env: $env_file"
 }
 
-write_systemd_units() {
-  cat >/etc/systemd/system/ssh-socks@.service <<'EOF'
-[Unit]
-Description=SSH SOCKS tunnel supervisor (%i)
-After=network-online.target
-Wants=network-online.target
+load_profile() {
+  local profile="$1" env_file
+  env_file="$(profile_env_path "$profile")"
+  [[ -r "$env_file" ]] || die "Profile not found: $profile"
+  # shellcheck disable=SC1090
+  source "$env_file"
+}
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/ssh_socks_farm_supervisor.sh %i
-Restart=always
-RestartSec=2
-# avoid killing all children if curl hangs etc; supervisor handles
-KillMode=process
-TimeoutStopSec=5
-# raise fd limit for many local sockets
-LimitNOFILE=200000
+list_profiles() {
+  section "Profiles"
+  local found=0 env_file profile enabled state_file unit_count active_count unit
+  local idx=0
+  shopt -s nullglob
+  for env_file in "$PROFILES_DIR"/*.env; do
+    found=1
+    idx=$((idx + 1))
+    profile="$(basename "$env_file" .env)"
+    # shellcheck disable=SC1090
+    source "$env_file"
+    enabled="${PROFILE_ENABLED:-YES}"
+    state_file="$(profile_state_path "$profile")"
+    unit_count=0
+    active_count=0
+    if [[ -r "$state_file" ]]; then
+      while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        unit_count=$((unit_count + 1))
+        if systemctl is-active --quiet "$unit"; then
+          active_count=$((active_count + 1))
+        fi
+      done <"$state_file"
+    fi
+    printf "  %d) %s (%s) | enabled=%s | active=%s/%s | %s@%s:%s\n" \
+      "$idx" "$profile" "$PORT_SPEC" "$enabled" "$active_count" "$unit_count" "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT"
+  done
+  shopt -u nullglob
+  (( found == 1 )) || echo "  (no profiles yet)"
+}
 
-[Install]
-WantedBy=multi-user.target
-EOF
+choose_profile_interactive() {
+  local -a names=() ports=()
+  local env_file item_profile
+  shopt -s nullglob
+  for env_file in "$PROFILES_DIR"/*.env; do
+    item_profile="$(basename "$env_file" .env)"
+    # shellcheck disable=SC1090
+    source "$env_file"
+    names+=("$item_profile")
+    ports+=("${PORT_SPEC:-}")
+  done
+  shopt -u nullglob
 
-  ok "Wrote systemd template: /etc/systemd/system/ssh-socks@.service"
+  if (( ${#names[@]} == 0 )); then
+    warn "No profiles available."
+    return 1
+  fi
+
+  echo "Profiles:"
+  local i ans idx
+  for ((i=0; i<${#names[@]}; i++)); do
+    echo "  $((i+1))) ${names[$i]} (${ports[$i]})"
+  done
+  while true; do
+    read -r -p "Select profile number (or b to back): " ans || true
+    case "${ans:-}" in
+      b|B|"")
+        return 1
+        ;;
+    esac
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#names[@]} )); then
+      idx=$((ans - 1))
+      printf '%s\n' "${names[$idx]}"
+      return 0
+    fi
+    warn "Invalid selection. Choose a valid number."
+  done
+}
+
+build_instances_for_profile() {
+  local profile="$1"
+  load_profile "$profile"
+
+  local -a ports=() instances=() unit_instances=()
+  local p idx=0 cores core short
+  mapfile -t ports < <(parse_ports_spec "$PORT_SPEC")
+  (( ${#ports[@]} > 0 )) || die "Profile has no valid ports: $profile"
+
+  cores="$(nproc)"
+  for p in "${ports[@]}"; do
+    if [[ "${PINNING:-NO}" == "YES" ]]; then
+      core=$(( idx % cores ))
+      short="${core}-${p}"
+    else
+      short="${p}"
+    fi
+    instances+=("$short")
+    unit_instances+=("ssh-tun@${profile}__${short}.service")
+    idx=$((idx + 1))
+  done
+
+  printf '%s\n' "${instances[@]}" >"${BASE_DIR}/.instances.tmp"
+  printf '%s\n' "${unit_instances[@]}" >"${BASE_DIR}/.unit_instances.tmp"
 }
 
 write_farm_unit() {
-  # Generates a per-profile unit that pulls up all configured instances.
-  local profile_id="$1"
-  shift
-  local instances=("$@")
-  local farm_service="ssh-socks-farm-${profile_id}.service"
-  FARM_SERVICE_NAME="$farm_service"
+  local profile="$1"
+  local farm_service="ssh-tun-farm-${profile}.service"
+  local dropin_dir="/etc/systemd/system/${farm_service}.d"
+  local farm_unit="/etc/systemd/system/${farm_service}"
+
   {
     echo "[Unit]"
-    echo "Description=SSH SOCKS farm (${profile_id})"
+    echo "Description=SSH tunnel farm (${profile})"
     echo "After=network-online.target"
     echo "Wants=network-online.target"
     echo
@@ -657,259 +649,459 @@ write_farm_unit() {
     echo
     echo "[Install]"
     echo "WantedBy=multi-user.target"
-  } >"/etc/systemd/system/${farm_service}"
+  } >"$farm_unit"
 
-  # Add Wants= via drop-in (cleaner)
-  mkdir -p "/etc/systemd/system/${farm_service}.d"
+  mkdir -p "$dropin_dir"
   {
     echo "[Unit]"
-    for inst in "${instances[@]}"; do
-      echo "Wants=ssh-socks@${inst}.service"
-      echo "After=ssh-socks@${inst}.service"
-    done
-  } >"/etc/systemd/system/${farm_service}.d/wants.conf"
-
-  ok "Wrote farm unit: /etc/systemd/system/${farm_service} (+ drop-in wants.conf)"
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      echo "Wants=${unit}"
+      echo "After=${unit}"
+    done <"${BASE_DIR}/.unit_instances.tmp"
+  } >"${dropin_dir}/wants.conf"
 }
 
-# ----------------------------- main -----------------------------
-main() {
-  need_root
+reconcile_instances() {
+  local profile="$1"
+  local state_file old_file
+  state_file="$(profile_state_path "$profile")"
+  old_file="${BASE_DIR}/.old_units.tmp"
 
-  echo
-  echo "============================================================"
-  echo " SSH SOCKS Farm Installer ${VERSION}"
-  echo "============================================================"
-
-  if ! have_cmd apt-get; then
-    die "This script currently supports Debian/Ubuntu (apt-get)."
+  if [[ -r "$state_file" ]]; then
+    cp "$state_file" "$old_file"
+  else
+    : >"$old_file"
   fi
 
-  section "Step 1/5 - Prerequisites"
-  log "Installing prerequisites (openssh-client, autossh, curl, iproute2)..."
-  install_pkgs openssh-client autossh curl iproute2 ca-certificates >/dev/null
-  ok "Prereqs installed."
+  cp "${BASE_DIR}/.unit_instances.tmp" "$state_file"
 
-  # Inputs
-  section "Step 2/5 - Connection & Ports"
-  local REMOTE_HOST REMOTE_PORT REMOTE_USER
-  prompt_default "Remote host/IP" "65.109.180.169" REMOTE_HOST
-  prompt_default "Remote SSH port" "22" REMOTE_PORT
-  prompt_default "Remote SSH user" "root" REMOTE_USER
-
-  local BIND_ADDR
-  prompt_default "Local bind address for SOCKS" "127.0.0.1" BIND_ADDR
-
-  local PORT_SPEC
-  local PORTS=()
-  local p ports_ok
-  PORT_SPEC="4040,1660,1661,1663,1664,1665,1667,1668,1669,1671,1672"
-  while true; do
-    prompt_default "SOCKS ports spec (e.g. 100-150 or 101,104,105)" "$PORT_SPEC" PORT_SPEC
-    if ! mapfile -t PORTS < <(parse_ports_spec "$PORT_SPEC"); then
-      warn "Bad ports spec. Try again."
-      continue
+  while IFS= read -r old; do
+    [[ -n "$old" ]] || continue
+    if ! grep -qxF "$old" "$state_file"; then
+      systemctl disable --now "$old" >/dev/null 2>&1 || true
     fi
-    (( ${#PORTS[@]} > 0 )) || { warn "No ports parsed. Try again."; continue; }
+  done <"$old_file"
+}
 
-    ports_ok="YES"
-    for p in "${PORTS[@]}"; do
-      if ! is_local_port_free "$p"; then
+deploy_profile() {
+  local profile="$1"
+  load_profile "$profile"
+  build_instances_for_profile "$profile"
+  write_farm_unit "$profile"
+  write_supervisor
+  write_systemd_template
+  systemd_reload
+  reconcile_instances "$profile"
+
+  local farm_service="ssh-tun-farm-${profile}.service"
+  if [[ "${PROFILE_ENABLED:-YES}" == "YES" ]]; then
+    systemctl enable --now "$farm_service" >/dev/null 2>&1 || true
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      systemctl enable --now "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+    done <"${BASE_DIR}/.unit_instances.tmp"
+    ok "Profile deployed and enabled: $profile"
+  else
+    systemctl disable --now "$farm_service" >/dev/null 2>&1 || true
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done <"${BASE_DIR}/.unit_instances.tmp"
+    ok "Profile deployed in disabled state: $profile"
+  fi
+
+  rm -f "${BASE_DIR}/.instances.tmp" "${BASE_DIR}/.unit_instances.tmp" "${BASE_DIR}/.old_units.tmp"
+}
+
+set_profile_enabled() {
+  local profile="$1" desired="$2"
+  local env_file
+  env_file="$(profile_env_path "$profile")"
+  [[ -r "$env_file" ]] || die "Profile not found: $profile"
+  sed -i -E "s/^PROFILE_ENABLED=.*/PROFILE_ENABLED=${desired}/" "$env_file"
+  deploy_profile "$profile"
+}
+
+remove_profile() {
+  local profile="$1"
+  local env_file state_file farm_service unit
+  env_file="$(profile_env_path "$profile")"
+  state_file="$(profile_state_path "$profile")"
+  [[ -r "$env_file" ]] || die "Profile not found: $profile"
+
+  if [[ -r "$state_file" ]]; then
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done <"$state_file"
+  fi
+
+  farm_service="ssh-tun-farm-${profile}.service"
+  systemctl disable --now "$farm_service" >/dev/null 2>&1 || true
+
+  rm -f "$env_file" "$state_file" "/etc/systemd/system/${farm_service}" "/etc/systemd/system/${farm_service}.d/wants.conf"
+  rmdir "/etc/systemd/system/${farm_service}.d" >/dev/null 2>&1 || true
+  systemd_reload
+  ok "Removed profile: $profile"
+}
+
+show_profile_status() {
+  local profile="$1" state_file unit
+  load_profile "$profile"
+  echo "Profile: $profile"
+  echo "  Enabled: ${PROFILE_ENABLED:-YES}"
+  echo "  Remote : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
+  echo "  Ports  : ${PORT_SPEC}"
+  echo "  Bind   : ${BIND_ADDR}"
+
+  state_file="$(profile_state_path "$profile")"
+  if [[ ! -r "$state_file" ]]; then
+    echo "  Units  : not deployed yet"
+    return 0
+  fi
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    if systemctl is-active --quiet "$unit"; then
+      echo "  [UP]   $unit"
+    else
+      echo "  [DOWN] $unit"
+    fi
+  done <"$state_file"
+}
+
+show_profile_logs() {
+  local profile="$1" follow="${2:-NO}" state_file unit
+  state_file="$(profile_state_path "$profile")"
+  [[ -r "$state_file" ]] || die "No deployed units for profile: $profile"
+
+  local -a args=(journalctl --no-pager)
+  if [[ "$follow" == "YES" ]]; then
+    args=(journalctl -f)
+  fi
+
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    args+=( -u "$unit" )
+  done <"$state_file"
+
+  "${args[@]}"
+}
+
+validate_profile_name() {
+  local profile="$1"
+  [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid profile name. Use only A-Za-z0-9._-"
+}
+
+create_or_update_profile_interactive() {
+  local mode="$1" profile="$2"
+  local env_file exists overwrite
+  validate_profile_name "$profile"
+  ensure_dirs
+
+  env_file="$(profile_env_path "$profile")"
+  exists="NO"
+  [[ -r "$env_file" ]] && exists="YES"
+
+  if [[ "$mode" == "create" && "$exists" == "YES" ]]; then
+    prompt_yesno "Profile exists. Overwrite and redeploy?" "NO" overwrite
+    [[ "$overwrite" == "YES" ]] || die "Cancelled."
+  fi
+  if [[ "$mode" == "update" && "$exists" == "NO" ]]; then
+    die "Profile not found: $profile"
+  fi
+
+  local REMOTE_HOST REMOTE_PORT REMOTE_USER BIND_ADDR PORT_SPEC PINNING OLD_PORT_SPEC
+  local CIPHERS REKEY_LIMIT SA_INT SA_CNT KEY_PATH GEN_KEY INSTALL_KEY
+  local KNOWN_HOSTS_FILE SSH_ALIAS PROFILE_ENABLED
+  local HC_URLS HC_TIMEOUT HC_RETRIES HC_INTERVAL HC_FAILS HEARTBEAT_EVERY DEBUG_HC
+
+  if [[ "$exists" == "YES" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+    OLD_PORT_SPEC="${PORT_SPEC:-}"
+  fi
+
+  section "Profile: $profile"
+  prompt_default "Remote host/IP" "${REMOTE_HOST:-}" REMOTE_HOST
+  prompt_default "Remote SSH port" "${REMOTE_PORT:-22}" REMOTE_PORT
+  prompt_default "Remote SSH user" "${REMOTE_USER:-root}" REMOTE_USER
+  prompt_default "Local bind address" "${BIND_ADDR:-127.0.0.1}" BIND_ADDR
+
+  local default_ports="${PORT_SPEC:-4040,1660,1661,1663,1664,1665,1667,1668,1669,1671,1672}"
+  local -a parsed_ports=()
+  local -a old_ports=()
+  local ports_ok p
+  if [[ "$exists" == "YES" && -n "${OLD_PORT_SPEC:-}" ]]; then
+    mapfile -t old_ports < <(parse_ports_spec "$OLD_PORT_SPEC" || true)
+  fi
+  while true; do
+    prompt_default "SOCKS ports spec" "$default_ports" PORT_SPEC
+    if mapfile -t parsed_ports < <(parse_ports_spec "$PORT_SPEC"); then
+      if (( ${#parsed_ports[@]} == 0 )); then
+        warn "No valid ports parsed."
+        continue
+      fi
+      ports_ok="YES"
+      for p in "${parsed_ports[@]}"; do
+        if is_local_port_free "$p"; then
+          continue
+        fi
+        # Allow unchanged ports from the same existing profile during update.
+        if [[ "$exists" == "YES" ]] && printf '%s\n' "${old_ports[@]}" | grep -qx "$p"; then
+          continue
+        fi
         ports_ok="NO"
+      done
+      if [[ "$ports_ok" == "YES" ]]; then
         break
       fi
-    done
-    if [[ "$ports_ok" == "YES" ]]; then
-      break
-    fi
-
-    warn "One or more selected SOCKS ports are already in use:"
-    for p in "${PORTS[@]}"; do
-      if ! is_local_port_free "$p"; then
+      warn "One or more selected ports are already in use. Choose different ports."
+      for p in "${parsed_ports[@]}"; do
+        if is_local_port_free "$p"; then
+          continue
+        fi
+        if [[ "$exists" == "YES" ]] && printf '%s\n' "${old_ports[@]}" | grep -qx "$p"; then
+          continue
+        fi
         show_port_conflict "$p"
-      fi
-    done
-    warn "Please choose different local SOCKS ports."
+      done
+      continue
+    fi
+    warn "Invalid port spec."
   done
 
-  local PINNING
-  prompt_yesno "Pin each SSH tunnel to a CPU core (round-robin)?" "YES" PINNING
+  prompt_yesno "Enable CPU pinning (round-robin)?" "${PINNING:-YES}" PINNING
 
-  local APPLY_LOCAL_TUNE APPLY_REMOTE_TUNE
-  prompt_yesno "Apply LOCAL network tuning (sysctl)?" "YES" APPLY_LOCAL_TUNE
-  prompt_yesno "Apply REMOTE tuning (sysctl + sshd drop-in) after key works?" "NO" APPLY_REMOTE_TUNE
+  if [[ -n "${CIPHERS:-}" ]]; then
+    prompt_yesno "Change SSH cipher? (current: $CIPHERS)" "NO" overwrite
+    if [[ "$overwrite" == "YES" ]]; then
+      prompt_cipher_choice CIPHERS
+    fi
+  else
+    prompt_cipher_choice CIPHERS
+  fi
 
-  # Crypto options
-  section "Step 3/5 - Crypto & Keepalive"
-  local CIPHERS REKEY_LIMIT SA_INT SA_CNT
-  prompt_cipher_choice CIPHERS
-  prompt_default "RekeyLimit (bytes time)" "4G 1h" REKEY_LIMIT
-  prompt_default "ServerAliveInterval (sec)" "30" SA_INT
-  prompt_default "ServerAliveCountMax" "3" SA_CNT
+  prompt_default "RekeyLimit" "${REKEY_LIMIT:-4G 1h}" REKEY_LIMIT
+  prompt_default "ServerAliveInterval" "${SERVER_ALIVE_INTERVAL:-30}" SA_INT
+  prompt_default "ServerAliveCountMax" "${SERVER_ALIVE_COUNTMAX:-3}" SA_CNT
 
-  # Key setup
-  section "Step 4/5 - SSH Key & Access"
-  local KEY_PATH GEN_KEY INSTALL_KEY
-  local host_tag alias_tag profile_tag SSH_HOST_ALIAS PROFILE_ID
-  host_tag="$(safe_host_tag "$REMOTE_HOST")"
-  alias_tag="$(safe_alias_tag "$REMOTE_HOST")"
-  SSH_HOST_ALIAS="sshfarm_${alias_tag}_p${REMOTE_PORT}"
-  profile_tag="${alias_tag//./_}"
-  PROFILE_ID="farm_${profile_tag}_p${REMOTE_PORT}"
-  PROFILE_ID="$(printf '%s' "$PROFILE_ID" | sed 's/_\+/_/g')"
-  prompt_default "SSH private key path" "/root/.ssh/id_ed25519_tunnel_${host_tag}_p${REMOTE_PORT}" KEY_PATH
+  KNOWN_HOSTS_FILE="${KNOWN_HOSTS_FILE:-$KNOWN_HOSTS_FILE_DEFAULT}"
+  prompt_default "Known hosts file" "$KNOWN_HOSTS_FILE" KNOWN_HOSTS_FILE
+
+  local host_tag
+  host_tag="$(safe_tag "$REMOTE_HOST")"
+  prompt_default "SSH private key path" "${KEY_PATH:-${ROOT_SSH_DIR}/id_ed25519_tunnel_${host_tag}_p${REMOTE_PORT}}" KEY_PATH
   prompt_yesno "Generate key if missing?" "YES" GEN_KEY
-  prompt_yesno "Install public key on remote (one-time, using password)?" "YES" INSTALL_KEY
+  prompt_yesno "Install public key on remote using password?" "${INSTALL_KEY:-YES}" INSTALL_KEY
 
-  mkdir -p /root/.ssh
-  chmod 700 /root/.ssh
+  prompt_default "Health URLs (comma-separated)" "${HC_URLS:-http://clients3.google.com/generate_204,http://connectivitycheck.gstatic.com/generate_204,http://www.msftconnecttest.com/connecttest.txt}" HC_URLS
+  prompt_default "Health timeout (sec)" "${HC_TIMEOUT:-5}" HC_TIMEOUT
+  prompt_default "Health retries" "${HC_RETRIES:-2}" HC_RETRIES
+  prompt_default "Health interval (sec)" "${HC_INTERVAL:-15}" HC_INTERVAL
+  prompt_default "Fails before restart" "${HC_FAILS_TO_RESTART:-3}" HC_FAILS
+  prompt_default "Heartbeat every N checks" "${HEARTBEAT_EVERY:-20}" HEARTBEAT_EVERY
+  prompt_yesno "Enable detailed health debug logs?" "${DEBUG_HEALTHCHECK:-NO}" DEBUG_HC
+
+  prompt_yesno "Enable this profile right after deploy?" "${PROFILE_ENABLED:-YES}" PROFILE_ENABLED
+
+  mkdir -p "$ROOT_SSH_DIR"
+  chmod 700 "$ROOT_SSH_DIR"
+  touch "$KNOWN_HOSTS_FILE"
+  chmod 600 "$KNOWN_HOSTS_FILE" || true
 
   if [[ ! -f "$KEY_PATH" ]]; then
     if [[ "$GEN_KEY" == "YES" ]]; then
-      log "Generating ed25519 key: $KEY_PATH"
+      log "Generating key: $KEY_PATH"
       ssh-keygen -t ed25519 -a 64 -N '' -f "$KEY_PATH" >/dev/null
-      ok "Generated key: $KEY_PATH"
+      ok "Key generated."
     else
-      die "Key not found and generation declined."
+      die "Key missing and generation declined."
     fi
-  else
-    ok "Key exists: $KEY_PATH"
   fi
   chmod 600 "$KEY_PATH" || true
-  write_ssh_config_host "$SSH_HOST_ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" "$KEY_PATH"
+  [[ -f "${KEY_PATH}.pub" ]] || die "Missing public key: ${KEY_PATH}.pub"
 
-  local PUB_PATH="${KEY_PATH}.pub"
-  [[ -f "$PUB_PATH" ]] || die "Missing public key: $PUB_PATH"
+  SSH_ALIAS="ssh_tun_${profile}"
+  write_ssh_config_host "$SSH_ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" "$KEY_PATH" "$KNOWN_HOSTS_FILE"
 
   if [[ "$INSTALL_KEY" == "YES" ]]; then
-    ok "Password login will be tested (you will type the password in the SSH prompt)."
     local attempt
-    for attempt in 1 2 3 4 5; do
-      log "Password probe attempt ${attempt}/5 ..."
-      if remote_password_probe "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT"; then
-        ok "Password auth OK."
+    for attempt in 1 2 3; do
+      log "Password auth probe ${attempt}/3"
+      if remote_password_probe "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KNOWN_HOSTS_FILE"; then
+        ok "Password auth works."
         break
       fi
-      warn "Password probe failed."
-      if [[ "$attempt" -eq 5 ]]; then
-        die "Password login failed after 5 attempts."
-      fi
+      [[ "$attempt" -eq 3 ]] && die "Password probe failed after 3 attempts."
     done
 
-    ok "Installing key on remote (you may be prompted for password again)..."
-    for attempt in 1 2 3 4 5; do
-      log "Key install attempt ${attempt}/5 ..."
-      if remote_install_pubkey_via_password "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$PUB_PATH"; then
-        ok "Key installed on remote."
+    for attempt in 1 2 3; do
+      log "Installing pubkey ${attempt}/3"
+      if remote_install_pubkey_via_password "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "${KEY_PATH}.pub" "$KNOWN_HOSTS_FILE"; then
+        ok "Public key installed."
         break
       fi
-      warn "Key install failed (attempt ${attempt}/5)."
-      if [[ "$attempt" -eq 5 ]]; then
-        die "Failed to install key after 5 attempts."
-      fi
+      [[ "$attempt" -eq 3 ]] && die "Failed to install key after 3 attempts."
     done
+  fi
 
-    log "Testing key auth..."
-    if remote_test_key "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KEY_PATH"; then
-      ok "Key auth works."
-    else
-      warn "Key auth test FAILED. You may need to check remote sshd or authorized_keys."
-    fi
+  if remote_test_key "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KEY_PATH" "$KNOWN_HOSTS_FILE"; then
+    ok "Key auth test passed."
   else
-    warn "Skipped remote key install."
+    warn "Key auth test failed. Tunnel may not start until SSH key access works."
   fi
 
-  if [[ "$APPLY_LOCAL_TUNE" == "YES" ]]; then
-    apply_local_tuning
-  fi
+  write_profile_env "$profile" "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_USER" "$KEY_PATH" "$BIND_ADDR" "$PORT_SPEC" \
+    "$PINNING" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
+    "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC"
 
-  section "Step 5/5 - Deploy Services"
-  # Write env + supervisor + systemd
-  write_env_file "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" "$KEY_PATH" "$BIND_ADDR" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$PINNING" "$SSH_HOST_ALIAS" "$PROFILE_ID"
+  deploy_profile "$profile"
+}
+
+install_cli() {
+  need_root
+  ensure_dirs
+  install -m 0755 "$SCRIPT_PATH" "$BIN_PATH"
   write_supervisor
-  write_systemd_units
+  write_systemd_template
   systemd_reload
+  ok "Installed CLI: $BIN_PATH"
+  ok "Run: ssh-tun"
+}
 
-  local CORES
-  CORES="$(nproc)"
-  log "Detected CPU cores: $CORES"
-
-  # Prepare instances (core-port if pinning else port) and profile-bound unit instance ids.
-  local instances=()
-  local unit_instances=()
-  local idx=0
-  for p in "${PORTS[@]}"; do
-    local short_inst
-    if [[ "$PINNING" == "YES" ]]; then
-      local core=$(( idx % CORES ))
-      short_inst="${core}-${p}"
-    else
-      short_inst="${p}"
-    fi
-    instances+=("${short_inst}")
-    unit_instances+=("${PROFILE_ID}__${short_inst}")
-    idx=$((idx+1))
-  done
-
-  local FARM_SERVICE_NAME
-  write_farm_unit "$PROFILE_ID" "${unit_instances[@]}"
+cmd_doctor() {
+  need_root
+  ensure_dirs
+  show_prereq_table
+  install_prereqs_interactive
+  write_supervisor
+  write_systemd_template
   systemd_reload
+  ok "Runtime assets validated."
+}
 
-  # Enable and start everything via the farm service
-  systemctl enable --now "$FARM_SERVICE_NAME" >/dev/null 2>&1 || true
-  ok "Enabled+started: ${FARM_SERVICE_NAME}"
+cmd_create() {
+  need_root
+  ensure_dirs
+  create_or_update_profile_interactive "create" "$1"
+}
 
-  # Start instances explicitly (to ensure immediate start even if systemd ordering is slow)
-  for inst in "${unit_instances[@]}"; do
-    systemctl enable --now "ssh-socks@${inst}.service" >/dev/null 2>&1 || systemctl start "ssh-socks@${inst}.service" >/dev/null 2>&1 || true
+cmd_update() {
+  need_root
+  ensure_dirs
+  create_or_update_profile_interactive "update" "$1"
+}
+
+main_menu() {
+  need_root
+  ensure_dirs
+    local choice profile
+  while true; do
+    section "${APP_NAME} ${VERSION}"
+    show_prereq_table
+    echo
+    echo "Options:"
+    echo "  1) Install/upgrade prerequisites"
+    echo "  2) List profiles"
+    echo "  3) Create new profile"
+    echo "  4) Update existing profile"
+    echo "  5) Enable profile"
+    echo "  6) Disable profile"
+    echo "  7) Delete profile"
+    echo "  8) Profile status"
+    echo "  9) Profile logs (follow)"
+    echo "  10) Install command to /usr/local/bin/ssh-tun"
+    echo "  0) Exit"
+    echo
+    echo "Tip: for profile actions, type 'b' to go back to this menu."
+
+    read -r -p "Choose option: " choice || true
+    case "${choice:-}" in
+      1) ( cmd_doctor ) || true ;;
+      2) ( list_profiles ) || true ;;
+      3)
+        read -r -p "New profile name (or b to back): " profile || true
+        [[ "${profile:-}" == "b" || "${profile:-}" == "B" || -z "${profile:-}" ]] || ( cmd_create "$profile" ) || true
+        ;;
+      4)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( cmd_update "$profile" ) || true
+        ;;
+      5)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "YES" ) || true
+        ;;
+      6)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "NO" ) || true
+        ;;
+      7)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( remove_profile "$profile" ) || true
+        ;;
+      8)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( show_profile_status "$profile" ) || true
+        ;;
+      9)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( show_profile_logs "$profile" "YES" ) || true
+        ;;
+      10) ( install_cli ) || true ;;
+      0) break ;;
+      *) warn "Invalid option." ;;
+    esac
+
+    echo
+    read -r -p "Press Enter to continue..." _ || true
   done
-  ok "Started ${#unit_instances[@]} tunnel instance(s)."
+}
 
-  if [[ "$APPLY_REMOTE_TUNE" == "YES" ]]; then
-    log "Applying remote tuning (requires key auth)."
-    apply_remote_tuning "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KEY_PATH" || true
-  fi
+usage() {
+  cat <<EOF
+${APP_NAME} ${VERSION}
+Usage:
+  ssh-tun                         # interactive menu
+  ssh-tun install                # install command to /usr/local/bin/ssh-tun
+  ssh-tun doctor                 # check/install prereqs + refresh runtime assets
+  ssh-tun list                   # list profiles
+  ssh-tun create <profile>       # create profile and deploy
+  ssh-tun update <profile>       # update profile and redeploy
+  ssh-tun enable <profile>       # enable/start profile
+  ssh-tun disable <profile>      # disable/stop profile
+  ssh-tun delete <profile>       # remove profile and units
+  ssh-tun status <profile>       # show detailed status
+  ssh-tun logs <profile> [--follow]
+EOF
+}
 
-  local env_file_path ports_csv instances_csv unit_instances_csv ports_regex sample_instance
-  env_file_path="/etc/ssh-socks-farm/${PROFILE_ID}.env"
-  ports_csv="$(IFS=,; echo "${PORTS[*]}")"
-  instances_csv="$(IFS=,; echo "${instances[*]}")"
-  unit_instances_csv="$(IFS=,; echo "${unit_instances[*]}")"
-  ports_regex="$(printf '%s|' "${PORTS[@]}")"
-  ports_regex="${ports_regex%|}"
-  sample_instance="${unit_instances[0]:-}"
-
-  section "Completed"
-  echo "Setup summary:"
-  echo "  Profile ID           : ${PROFILE_ID}"
-  echo "  Remote target        : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
-  echo "  SSH config alias     : ${SSH_HOST_ALIAS}"
-  echo "  SSH config file      : /root/.ssh/config"
-  echo "  Env file             : ${env_file_path}"
-  echo "  SSH private key      : ${KEY_PATH}"
-  echo "  Local bind           : ${BIND_ADDR}"
-  echo "  SOCKS ports          : ${ports_csv}"
-  echo "  Instance IDs         : ${instances_csv}"
-  echo "  Unit instances       : ${unit_instances_csv}"
-  echo "  Farm service         : ${FARM_SERVICE_NAME}"
-  echo "  Cipher               : ${CIPHERS}"
-  echo "  RekeyLimit           : ${REKEY_LIMIT}"
-  echo "  ServerAlive          : interval=${SA_INT}s countmax=${SA_CNT}"
-  echo "  CPU pinning          : ${PINNING}"
-  echo "  Local tuning         : ${APPLY_LOCAL_TUNE}"
-  echo "  Remote tuning        : ${APPLY_REMOTE_TUNE}"
-  echo "  Healthcheck URL      : http://clients3.google.com/generate_204"
-  echo
-  echo "Useful commands:"
-  echo "  ssh ${SSH_HOST_ALIAS} 'hostname -f'"
-  echo "  systemctl status ${FARM_SERVICE_NAME}"
-  echo "  systemctl --no-pager --full status 'ssh-socks@*'"
-  if [[ -n "$sample_instance" ]]; then
-    echo "  journalctl -u ssh-socks@${sample_instance} -f --no-pager"
-  fi
-  if [[ -n "$ports_regex" ]]; then
-    echo "  ss -lntp | egrep ':(${ports_regex})\\b'"
-  fi
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    "") main_menu ;;
+    install) shift; install_cli ;;
+    doctor) shift; cmd_doctor ;;
+    list) shift; need_root; ensure_dirs; list_profiles ;;
+    create) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_create "$1" ;;
+    update) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_update "$1" ;;
+    enable) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; set_profile_enabled "$1" "YES" ;;
+    disable) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; set_profile_enabled "$1" "NO" ;;
+    delete) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; remove_profile "$1" ;;
+    status) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; show_profile_status "$1" ;;
+    logs)
+      shift
+      [[ $# -ge 1 ]] || die "Profile name required."
+      need_root
+      if [[ "${2:-}" == "--follow" || "${2:-}" == "-f" ]]; then
+        show_profile_logs "$1" "YES"
+      else
+        show_profile_logs "$1" "NO"
+      fi
+      ;;
+    -h|--help|help) usage ;;
+    *) usage; die "Unknown command: $cmd" ;;
+  esac
 }
 
 main "$@"
