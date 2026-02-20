@@ -364,7 +364,7 @@ Type=simple
 ExecStart=${SUPERVISOR_PATH} %i
 Restart=always
 RestartSec=2
-KillMode=process
+KillMode=control-group
 TimeoutStopSec=5
 LimitNOFILE=200000
 
@@ -491,9 +491,9 @@ EOF
 
 write_profile_env() {
   local profile="$1" remote_host="$2" remote_port="$3" remote_user="$4" key_path="$5" bind_addr="$6"
-  local ports_csv="$7" pinning="$8" ciphers="$9" rekey="${10}" sa_int="${11}" sa_cnt="${12}"
-  local known_hosts="${13}" ssh_alias="${14}" profile_enabled="${15}" hc_urls="${16}" hc_timeout="${17}" hc_retries="${18}"
-  local hc_interval="${19}" hc_fails="${20}" heartbeat_every="${21}" debug_hc="${22}"
+  local ports_csv="$7" normal_ports_csv="$8" pinned_ports_csv="$9" pinning="${10}" ciphers="${11}" rekey="${12}" sa_int="${13}" sa_cnt="${14}"
+  local known_hosts="${15}" ssh_alias="${16}" profile_enabled="${17}" hc_urls="${18}" hc_timeout="${19}" hc_retries="${20}"
+  local hc_interval="${21}" hc_fails="${22}" heartbeat_every="${23}" debug_hc="${24}"
 
   local env_file
   env_file="$(profile_env_path "$profile")"
@@ -507,6 +507,8 @@ write_profile_env() {
     printf 'KEY_PATH=%q\n' "$key_path"
     printf 'BIND_ADDR=%q\n' "$bind_addr"
     printf 'PORT_SPEC=%q\n' "$ports_csv"
+    printf 'NORMAL_PORT_SPEC=%q\n' "$normal_ports_csv"
+    printf 'PINNED_PORT_SPEC=%q\n' "$pinned_ports_csv"
     printf 'PINNING=%q\n' "$pinning"
     printf 'CIPHERS=%q\n' "$ciphers"
     printf 'REKEY_LIMIT=%q\n' "$rekey"
@@ -608,19 +610,37 @@ build_instances_for_profile() {
   local profile="$1"
   load_profile "$profile"
 
-  local -a ports=() instances=() unit_instances=()
+  local -a normal_ports=() pinned_ports=() legacy_ports=() instances=() unit_instances=()
   local p idx=0 cores core short
-  mapfile -t ports < <(parse_ports_spec "$PORT_SPEC")
-  (( ${#ports[@]} > 0 )) || die "Profile has no valid ports: $profile"
+
+  # Backward compatibility:
+  # Old profiles may only have PORT_SPEC + PINNING.
+  if [[ -n "${NORMAL_PORT_SPEC:-}" || -n "${PINNED_PORT_SPEC:-}" ]]; then
+    if [[ -n "${NORMAL_PORT_SPEC:-}" ]]; then
+      mapfile -t normal_ports < <(parse_ports_spec "$NORMAL_PORT_SPEC")
+    fi
+    if [[ -n "${PINNED_PORT_SPEC:-}" ]]; then
+      mapfile -t pinned_ports < <(parse_ports_spec "$PINNED_PORT_SPEC")
+    fi
+  else
+    mapfile -t legacy_ports < <(parse_ports_spec "$PORT_SPEC")
+    if [[ "${PINNING:-NO}" == "YES" ]]; then
+      pinned_ports=("${legacy_ports[@]}")
+    else
+      normal_ports=("${legacy_ports[@]}")
+    fi
+  fi
+  (( ${#normal_ports[@]} + ${#pinned_ports[@]} > 0 )) || die "Profile has no valid ports: $profile"
 
   cores="$(nproc)"
-  for p in "${ports[@]}"; do
-    if [[ "${PINNING:-NO}" == "YES" ]]; then
-      core=$(( idx % cores ))
-      short="${core}-${p}"
-    else
-      short="${p}"
-    fi
+  for p in "${normal_ports[@]}"; do
+    short="${p}"
+    instances+=("$short")
+    unit_instances+=("ssh-tun@${profile}__${short}.service")
+  done
+  for p in "${pinned_ports[@]}"; do
+    core=$(( idx % cores ))
+    short="${core}-${p}"
     instances+=("$short")
     unit_instances+=("ssh-tun@${profile}__${short}.service")
     idx=$((idx + 1))
@@ -725,10 +745,15 @@ set_profile_enabled() {
 
 remove_profile() {
   local profile="$1"
-  local env_file state_file farm_service unit
+  local env_file state_file farm_service unit bind_addr
+  local -a ports=()
   env_file="$(profile_env_path "$profile")"
   state_file="$(profile_state_path "$profile")"
   [[ -r "$env_file" ]] || die "Profile not found: $profile"
+  # shellcheck disable=SC1090
+  source "$env_file"
+  bind_addr="${BIND_ADDR:-127.0.0.1}"
+  mapfile -t ports < <(parse_ports_spec "${PORT_SPEC:-}" || true)
 
   if [[ -r "$state_file" ]]; then
     while IFS= read -r unit; do
@@ -739,6 +764,26 @@ remove_profile() {
 
   farm_service="ssh-tun-farm-${profile}.service"
   systemctl disable --now "$farm_service" >/dev/null 2>&1 || true
+
+  # Safety cleanup: if any ssh child survives stop (shouldn't with control-group), kill it.
+  local p pid comm
+  for p in "${ports[@]}"; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+      [[ "$comm" == "ssh" ]] || continue
+      kill "$pid" >/dev/null 2>&1 || true
+    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || true)
+  done
+  sleep 1
+  for p in "${ports[@]}"; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+      [[ "$comm" == "ssh" ]] || continue
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || true)
+  done
 
   rm -f "$env_file" "$state_file" "/etc/systemd/system/${farm_service}" "/etc/systemd/system/${farm_service}.d/wants.conf"
   rmdir "/etc/systemd/system/${farm_service}.d" >/dev/null 2>&1 || true
@@ -811,7 +856,7 @@ create_or_update_profile_interactive() {
     die "Profile not found: $profile"
   fi
 
-  local REMOTE_HOST REMOTE_PORT REMOTE_USER BIND_ADDR PORT_SPEC PINNING OLD_PORT_SPEC
+  local REMOTE_HOST REMOTE_PORT REMOTE_USER BIND_ADDR PORT_SPEC NORMAL_PORT_SPEC PINNED_PORT_SPEC PINNING OLD_PORT_SPEC OLD_NORMAL_PORT_SPEC OLD_PINNED_PORT_SPEC
   local CIPHERS REKEY_LIMIT SA_INT SA_CNT KEY_PATH GEN_KEY INSTALL_KEY
   local KNOWN_HOSTS_FILE SSH_ALIAS PROFILE_ENABLED
   local HC_URLS HC_TIMEOUT HC_RETRIES HC_INTERVAL HC_FAILS HEARTBEAT_EVERY DEBUG_HC
@@ -820,6 +865,8 @@ create_or_update_profile_interactive() {
     # shellcheck disable=SC1090
     source "$env_file"
     OLD_PORT_SPEC="${PORT_SPEC:-}"
+    OLD_NORMAL_PORT_SPEC="${NORMAL_PORT_SPEC:-}"
+    OLD_PINNED_PORT_SPEC="${PINNED_PORT_SPEC:-}"
   fi
 
   section "Profile: $profile"
@@ -828,50 +875,94 @@ create_or_update_profile_interactive() {
   prompt_default "Remote SSH user" "${REMOTE_USER:-root}" REMOTE_USER
   prompt_default "Local bind address" "${BIND_ADDR:-127.0.0.1}" BIND_ADDR
 
-  local default_ports="${PORT_SPEC:-4040,1660,1661,1663,1664,1665,1667,1668,1669,1671,1672}"
-  local -a parsed_ports=()
-  local -a old_ports=()
+  local default_normal_ports="${NORMAL_PORT_SPEC:-4040}"
+  local default_pinned_ports
+  if [[ -n "${PINNED_PORT_SPEC:-}" ]]; then
+    default_pinned_ports="${PINNED_PORT_SPEC}"
+  else
+    default_pinned_ports="${PORT_SPEC:-1660,1661,1663,1664,1665,1667,1668,1669,1671,1672}"
+  fi
+  local -a normal_ports=() pinned_ports=() parsed_ports=()
+  local -a old_ports=() old_normal_ports=() old_pinned_ports=()
   local ports_ok p
-  if [[ "$exists" == "YES" && -n "${OLD_PORT_SPEC:-}" ]]; then
-    mapfile -t old_ports < <(parse_ports_spec "$OLD_PORT_SPEC" || true)
+  if [[ "$exists" == "YES" ]]; then
+    if [[ -n "${OLD_NORMAL_PORT_SPEC:-}" ]]; then
+      mapfile -t old_normal_ports < <(parse_ports_spec "$OLD_NORMAL_PORT_SPEC" || true)
+    fi
+    if [[ -n "${OLD_PINNED_PORT_SPEC:-}" ]]; then
+      mapfile -t old_pinned_ports < <(parse_ports_spec "$OLD_PINNED_PORT_SPEC" || true)
+    fi
+    if [[ ${#old_normal_ports[@]} -eq 0 && ${#old_pinned_ports[@]} -eq 0 && -n "${OLD_PORT_SPEC:-}" ]]; then
+      mapfile -t old_ports < <(parse_ports_spec "$OLD_PORT_SPEC" || true)
+      if [[ "${PINNING:-NO}" == "YES" ]]; then
+        old_pinned_ports=("${old_ports[@]}")
+      else
+        old_normal_ports=("${old_ports[@]}")
+      fi
+    fi
   fi
   while true; do
-    prompt_default "SOCKS ports spec" "$default_ports" PORT_SPEC
-    if mapfile -t parsed_ports < <(parse_ports_spec "$PORT_SPEC"); then
-      if (( ${#parsed_ports[@]} == 0 )); then
-        warn "No valid ports parsed."
+    prompt_default "Normal SOCKS ports (optional, type 'none' for no normal tunnel)" "$default_normal_ports" NORMAL_PORT_SPEC
+    prompt_default "Pinned-per-core SOCKS ports (optional, type 'none' for no pinned tunnel)" "$default_pinned_ports" PINNED_PORT_SPEC
+    if [[ "${NORMAL_PORT_SPEC,,}" == "none" ]]; then NORMAL_PORT_SPEC=""; fi
+    if [[ "${PINNED_PORT_SPEC,,}" == "none" ]]; then PINNED_PORT_SPEC=""; fi
+
+    normal_ports=()
+    pinned_ports=()
+    if [[ -n "${NORMAL_PORT_SPEC// /}" ]]; then
+      if ! mapfile -t normal_ports < <(parse_ports_spec "$NORMAL_PORT_SPEC"); then
+        warn "Invalid normal ports spec."
         continue
       fi
-      ports_ok="YES"
-      for p in "${parsed_ports[@]}"; do
-        if is_local_port_free "$p"; then
-          continue
-        fi
-        # Allow unchanged ports from the same existing profile during update.
-        if [[ "$exists" == "YES" ]] && printf '%s\n' "${old_ports[@]}" | grep -qx "$p"; then
-          continue
-        fi
-        ports_ok="NO"
-      done
-      if [[ "$ports_ok" == "YES" ]]; then
-        break
+    fi
+    if [[ -n "${PINNED_PORT_SPEC// /}" ]]; then
+      if ! mapfile -t pinned_ports < <(parse_ports_spec "$PINNED_PORT_SPEC"); then
+        warn "Invalid pinned ports spec."
+        continue
       fi
-      warn "One or more selected ports are already in use. Choose different ports."
-      for p in "${parsed_ports[@]}"; do
-        if is_local_port_free "$p"; then
-          continue
-        fi
-        if [[ "$exists" == "YES" ]] && printf '%s\n' "${old_ports[@]}" | grep -qx "$p"; then
-          continue
-        fi
-        show_port_conflict "$p"
-      done
+    fi
+
+    parsed_ports=("${normal_ports[@]}" "${pinned_ports[@]}")
+    if (( ${#parsed_ports[@]} == 0 )); then
+      warn "At least one normal or pinned port is required."
       continue
     fi
-    warn "Invalid port spec."
-  done
 
-  prompt_yesno "Enable CPU pinning (round-robin)?" "${PINNING:-YES}" PINNING
+    if printf '%s\n' "${parsed_ports[@]}" | sort -n | uniq -d | grep -q .; then
+      warn "Duplicate ports detected across normal/pinned groups. Remove duplicates."
+      continue
+    fi
+
+    ports_ok="YES"
+    for p in "${parsed_ports[@]}"; do
+      if is_local_port_free "$p"; then
+        continue
+      fi
+      if [[ "$exists" == "YES" ]] && (printf '%s\n' "${old_normal_ports[@]}" | grep -qx "$p" || printf '%s\n' "${old_pinned_ports[@]}" | grep -qx "$p"); then
+        continue
+      fi
+      ports_ok="NO"
+    done
+    if [[ "$ports_ok" == "YES" ]]; then
+      break
+    fi
+    warn "One or more selected ports are already in use. Choose different ports."
+    for p in "${parsed_ports[@]}"; do
+      if is_local_port_free "$p"; then
+        continue
+      fi
+      if [[ "$exists" == "YES" ]] && (printf '%s\n' "${old_normal_ports[@]}" | grep -qx "$p" || printf '%s\n' "${old_pinned_ports[@]}" | grep -qx "$p"); then
+        continue
+      fi
+      show_port_conflict "$p"
+    done
+  done
+  if (( ${#pinned_ports[@]} > 0 )); then
+    PINNING="YES"
+  else
+    PINNING="NO"
+  fi
+  PORT_SPEC="$(IFS=,; echo "${parsed_ports[*]}")"
 
   if [[ -n "${CIPHERS:-}" ]]; then
     prompt_yesno "Change SSH cipher? (current: $CIPHERS)" "NO" overwrite
@@ -953,7 +1044,7 @@ create_or_update_profile_interactive() {
   fi
 
   write_profile_env "$profile" "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_USER" "$KEY_PATH" "$BIND_ADDR" "$PORT_SPEC" \
-    "$PINNING" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
+    "$NORMAL_PORT_SPEC" "$PINNED_PORT_SPEC" "$PINNING" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
     "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC"
 
   deploy_profile "$profile"
