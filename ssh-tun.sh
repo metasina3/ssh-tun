@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v8"
+VERSION="v9.0.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -137,6 +137,18 @@ safe_tag() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/_\+/_
 profile_env_path() { printf '%s/%s.env' "$PROFILES_DIR" "$1"; }
 profile_state_path() { printf '%s/%s.instances' "$PROFILES_DIR" "$1"; }
 
+# Read a single variable from a profile env file WITHOUT polluting the caller's
+# shell. Sourcing happens in a subshell so values never leak between profiles.
+profile_get() {
+  local env_file="$1" var="$2"
+  [[ -r "$env_file" ]] || return 0
+  (
+    # shellcheck disable=SC1090
+    source "$env_file" >/dev/null 2>&1 || true
+    printf '%s' "${!var:-}"
+  )
+}
+
 ensure_dirs() {
   mkdir -p "$PROFILES_DIR" "$LIBEXEC_DIR" "$ROOT_SSH_DIR"
   chmod 700 "$ROOT_SSH_DIR"
@@ -263,6 +275,7 @@ SSH_OPTS=(
   -i "${KEY_PATH}"
   -o "IdentitiesOnly=yes"
   -o "Compression=no"
+  -o "IPQoS=throughput"
   -o "Ciphers=${CIPHERS}"
   -o "RekeyLimit=${REKEY_LIMIT}"
   -o "ExitOnForwardFailure=yes"
@@ -298,21 +311,36 @@ probe_socks_http() {
   return 1
 }
 
+# Start ssh as a DIRECT child of this supervisor and record its PID in the
+# global SSH_PID. Using a command substitution here (SSH_PID="$(...)") would run
+# ssh inside a subshell that immediately exits, orphaning ssh and breaking the
+# `wait "$SSH_PID"` below (you cannot wait on a non-child).
+SSH_PID=""
 start_ssh_bg() {
   if [[ "$PINNING" == "YES" && "$CORE" =~ ^[0-9]+$ ]]; then
     taskset -c "$CORE" ssh "${SSH_OPTS[@]}" "$SSH_TARGET" &
   else
     ssh "${SSH_OPTS[@]}" "$SSH_TARGET" &
   fi
-  echo $!
+  SSH_PID=$!
 }
+
+cleanup() {
+  trap - TERM INT
+  if [[ -n "${SSH_PID:-}" ]]; then
+    kill "$SSH_PID" >/dev/null 2>&1 || true
+    wait "$SSH_PID" >/dev/null 2>&1 || true
+  fi
+  exit 0
+}
+trap cleanup TERM INT
 
 FAILS=0
 HEARTBEAT_COUNT=0
 LAST_STATE="STARTING"
 
 while true; do
-  SSH_PID="$(start_ssh_bg)"
+  start_ssh_bg
   FAILS=0
   HEARTBEAT_COUNT=0
   LAST_STATE="UP"
@@ -366,7 +394,9 @@ Restart=always
 RestartSec=2
 KillMode=control-group
 TimeoutStopSec=5
-LimitNOFILE=200000
+LimitNOFILE=1048576
+CPUWeight=200
+IOWeight=200
 
 [Install]
 WantedBy=multi-user.target
@@ -539,15 +569,18 @@ load_profile() {
 list_profiles() {
   section "Profiles"
   local found=0 env_file profile enabled state_file unit_count active_count unit
+  local port_spec remote_user remote_host remote_port
   local idx=0
   shopt -s nullglob
   for env_file in "$PROFILES_DIR"/*.env; do
     found=1
     idx=$((idx + 1))
     profile="$(basename "$env_file" .env)"
-    # shellcheck disable=SC1090
-    source "$env_file"
-    enabled="${PROFILE_ENABLED:-YES}"
+    port_spec="$(profile_get "$env_file" PORT_SPEC)"
+    enabled="$(profile_get "$env_file" PROFILE_ENABLED)"; enabled="${enabled:-YES}"
+    remote_user="$(profile_get "$env_file" REMOTE_USER)"
+    remote_host="$(profile_get "$env_file" REMOTE_HOST)"
+    remote_port="$(profile_get "$env_file" REMOTE_PORT)"
     state_file="$(profile_state_path "$profile")"
     unit_count=0
     active_count=0
@@ -561,22 +594,23 @@ list_profiles() {
       done <"$state_file"
     fi
     printf "  %d) %s (%s) | enabled=%s | active=%s/%s | %s@%s:%s\n" \
-      "$idx" "$profile" "$PORT_SPEC" "$enabled" "$active_count" "$unit_count" "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT"
+      "$idx" "$profile" "$port_spec" "$enabled" "$active_count" "$unit_count" "$remote_user" "$remote_host" "$remote_port"
   done
   shopt -u nullglob
   (( found == 1 )) || echo "  (no profiles yet)"
 }
 
 choose_profile_interactive() {
+  # NOTE: This function is called via $(...) so its stdout is captured as the
+  # selected profile name. All UI output MUST go to stderr, otherwise the menu
+  # is swallowed by the command substitution and the user sees no list.
   local -a names=() ports=()
   local env_file item_profile
   shopt -s nullglob
   for env_file in "$PROFILES_DIR"/*.env; do
     item_profile="$(basename "$env_file" .env)"
-    # shellcheck disable=SC1090
-    source "$env_file"
     names+=("$item_profile")
-    ports+=("${PORT_SPEC:-}")
+    ports+=("$(profile_get "$env_file" PORT_SPEC)")
   done
   shopt -u nullglob
 
@@ -585,10 +619,10 @@ choose_profile_interactive() {
     return 1
   fi
 
-  echo "Profiles:"
+  echo "Profiles:" >&2
   local i ans idx
   for ((i=0; i<${#names[@]}; i++)); do
-    echo "  $((i+1))) ${names[$i]} (${ports[$i]})"
+    echo "  $((i+1))) ${names[$i]} (${ports[$i]})" >&2
   done
   while true; do
     read -r -p "Select profile number (or b to back): " ans || true
@@ -646,8 +680,8 @@ build_instances_for_profile() {
     idx=$((idx + 1))
   done
 
-  printf '%s\n' "${instances[@]}" >"${BASE_DIR}/.instances.tmp"
-  printf '%s\n' "${unit_instances[@]}" >"${BASE_DIR}/.unit_instances.tmp"
+  printf '%s\n' "${instances[@]}" >"$TMP_INSTANCES"
+  printf '%s\n' "${unit_instances[@]}" >"$TMP_UNIT_INSTANCES"
 }
 
 write_farm_unit() {
@@ -678,7 +712,7 @@ write_farm_unit() {
       [[ -n "$unit" ]] || continue
       echo "Wants=${unit}"
       echo "After=${unit}"
-    done <"${BASE_DIR}/.unit_instances.tmp"
+    done <"$TMP_UNIT_INSTANCES"
   } >"${dropin_dir}/wants.conf"
 }
 
@@ -686,7 +720,7 @@ reconcile_instances() {
   local profile="$1"
   local state_file old_file
   state_file="$(profile_state_path "$profile")"
-  old_file="${BASE_DIR}/.old_units.tmp"
+  old_file="$TMP_OLD_UNITS"
 
   if [[ -r "$state_file" ]]; then
     cp "$state_file" "$old_file"
@@ -694,7 +728,7 @@ reconcile_instances() {
     : >"$old_file"
   fi
 
-  cp "${BASE_DIR}/.unit_instances.tmp" "$state_file"
+  cp "$TMP_UNIT_INSTANCES" "$state_file"
 
   while IFS= read -r old; do
     [[ -n "$old" ]] || continue
@@ -707,6 +741,17 @@ reconcile_instances() {
 deploy_profile() {
   local profile="$1"
   load_profile "$profile"
+
+  # Per-deploy unique temp files so two concurrent deploys never clobber each
+  # other's instance/unit lists. Cleaned up on any exit from this function.
+  local tag
+  tag="$(safe_tag "$profile")"
+  TMP_INSTANCES="$(mktemp "${BASE_DIR}/.${tag}.instances.XXXXXX")"
+  TMP_UNIT_INSTANCES="$(mktemp "${BASE_DIR}/.${tag}.units.XXXXXX")"
+  TMP_OLD_UNITS="$(mktemp "${BASE_DIR}/.${tag}.old.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -f '$TMP_INSTANCES' '$TMP_UNIT_INSTANCES' '$TMP_OLD_UNITS'" RETURN
+
   build_instances_for_profile "$profile"
   write_farm_unit "$profile"
   write_supervisor
@@ -720,18 +765,16 @@ deploy_profile() {
     while IFS= read -r unit; do
       [[ -n "$unit" ]] || continue
       systemctl enable --now "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
-    done <"${BASE_DIR}/.unit_instances.tmp"
+    done <"$TMP_UNIT_INSTANCES"
     ok "Profile deployed and enabled: $profile"
   else
     systemctl disable --now "$farm_service" >/dev/null 2>&1 || true
     while IFS= read -r unit; do
       [[ -n "$unit" ]] || continue
       systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    done <"${BASE_DIR}/.unit_instances.tmp"
+    done <"$TMP_UNIT_INSTANCES"
     ok "Profile deployed in disabled state: $profile"
   fi
-
-  rm -f "${BASE_DIR}/.instances.tmp" "${BASE_DIR}/.unit_instances.tmp" "${BASE_DIR}/.old_units.tmp"
 }
 
 set_profile_enabled() {
@@ -836,6 +879,11 @@ show_profile_logs() {
 validate_profile_name() {
   local profile="$1"
   [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid profile name. Use only A-Za-z0-9._-"
+  # '__' is the reserved delimiter between profile id and instance in systemd
+  # instance names (ssh-tun@<profile>__<instance>), so it must not appear here.
+  [[ "$profile" != *"__"* ]] || die "Invalid profile name: '__' is reserved and not allowed."
+  # Leading dot/dash collide with hidden temp files and getopt-style parsing.
+  [[ "$profile" != .* && "$profile" != -* ]] || die "Profile name must not start with '.' or '-'."
 }
 
 create_or_update_profile_interactive() {
@@ -909,17 +957,22 @@ create_or_update_profile_interactive() {
 
     normal_ports=()
     pinned_ports=()
+    local parse_out
     if [[ -n "${NORMAL_PORT_SPEC// /}" ]]; then
-      if ! mapfile -t normal_ports < <(parse_ports_spec "$NORMAL_PORT_SPEC"); then
+      # mapfile always succeeds, so capture parse output first and check its
+      # real exit code; otherwise invalid specs are silently dropped.
+      if ! parse_out="$(parse_ports_spec "$NORMAL_PORT_SPEC")" || [[ -z "$parse_out" ]]; then
         warn "Invalid normal ports spec."
         continue
       fi
+      mapfile -t normal_ports <<< "$parse_out"
     fi
     if [[ -n "${PINNED_PORT_SPEC// /}" ]]; then
-      if ! mapfile -t pinned_ports < <(parse_ports_spec "$PINNED_PORT_SPEC"); then
+      if ! parse_out="$(parse_ports_spec "$PINNED_PORT_SPEC")" || [[ -z "$parse_out" ]]; then
         warn "Invalid pinned ports spec."
         continue
       fi
+      mapfile -t pinned_ports <<< "$parse_out"
     fi
 
     parsed_ports=("${normal_ports[@]}" "${pinned_ports[@]}")
@@ -1050,6 +1103,216 @@ create_or_update_profile_interactive() {
   deploy_profile "$profile"
 }
 
+LOCAL_SYSCTL_FILE="/etc/sysctl.d/99-ssh-tun.conf"
+LOCAL_LIMITS_FILE="/etc/security/limits.d/99-ssh-tun.conf"
+REMOTE_SSHD_DROPIN="/etc/ssh/sshd_config.d/99-ssh-tun.conf"
+REMOTE_SYSCTL_FILE="/etc/sysctl.d/99-ssh-tun.conf"
+NOFILE_LIMIT="1048576"
+
+# Single source of truth for the network tuning, used verbatim on BOTH the
+# local host and the remote endpoint so the whole path is symmetric.
+# Goal: maximum sustained bandwidth over a high-latency international link for
+# many concurrent SSH/SOCKS flows.
+#   - BBR + fq: best loss-tolerant congestion control + pacing.
+#   - 64 MiB socket buffers: covers a large bandwidth-delay product
+#     (e.g. ~1 Gbps at ~500 ms RTT) while still being autotuned per socket.
+#   - notsent_lowat: caps unsent data in the local queue -> lower latency and
+#     better fairness across the many multiplexed SOCKS streams.
+#   - tw_reuse + wide port range: survive heavy short-lived connection churn.
+print_sysctl_tuning() {
+  cat <<'SYS'
+# Managed by ssh-tun. Tuning for many concurrent SSH/SOCKS tunnels.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.core.optmem_max = 65536
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 131072 67108864
+net.core.somaxconn = 16384
+net.core.netdev_max_backlog = 32768
+net.core.netdev_budget = 600
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+fs.file-max = 4194304
+SYS
+}
+
+print_sshd_tuning() {
+  cat <<'SSHD'
+# Managed by ssh-tun (remote endpoint).
+AllowTcpForwarding yes
+GatewayPorts no
+PermitTunnel no
+ClientAliveInterval 30
+ClientAliveCountMax 3
+TCPKeepAlive yes
+Compression no
+UseDNS no
+MaxSessions 100
+MaxStartups 200:30:600
+SSHD
+}
+
+optimize_local() {
+  need_root
+  section "Local network optimization (max bandwidth)"
+
+  print_sysctl_tuning >"$LOCAL_SYSCTL_FILE"
+
+  # Try to load BBR now and persist the module.
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  echo "tcp_bbr" >/etc/modules-load.d/ssh-tun-bbr.conf
+
+  if sysctl --system >/dev/null 2>&1; then
+    ok "Applied sysctl tuning ($LOCAL_SYSCTL_FILE)."
+  else
+    warn "sysctl --system reported issues; check $LOCAL_SYSCTL_FILE."
+  fi
+
+  local cc qd
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  if [[ "$cc" == "bbr" ]]; then
+    ok "Congestion control active: bbr / qdisc: $qd"
+  else
+    warn "Congestion control is '$cc' (kernel may lack BBR; >=4.9 required)."
+  fi
+
+  # Raise open-file limits so many tunnels/channels don't hit EMFILE.
+  cat >"$LOCAL_LIMITS_FILE" <<EOF
+# Managed by ssh-tun.
+*    soft nofile ${NOFILE_LIMIT}
+*    hard nofile ${NOFILE_LIMIT}
+root soft nofile ${NOFILE_LIMIT}
+root hard nofile ${NOFILE_LIMIT}
+EOF
+  ok "Wrote open-file limits ($LOCAL_LIMITS_FILE). Re-login for shells to pick it up."
+
+  # Make sure the systemd-managed tunnels also get the high fd limit and the
+  # new supervisor that sets IPQoS=throughput.
+  write_systemd_template
+  write_supervisor
+  systemd_reload
+  ok "Refreshed unit template (LimitNOFILE=${NOFILE_LIMIT}) and supervisor."
+  log "Run 'ssh-tun update <profile>' (or restart units) to apply to running tunnels."
+}
+
+# Build ssh args (key auth) for talking to a profile's remote host as admin.
+remote_admin_ssh() {
+  local profile="$1"; shift
+  load_profile "$profile"
+  local kh="${KNOWN_HOSTS_FILE:-$KNOWN_HOSTS_FILE_DEFAULT}"
+  ssh -F /dev/null -T \
+    -p "$REMOTE_PORT" -i "$KEY_PATH" \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$kh" \
+    -o LogLevel=ERROR \
+    "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+}
+
+optimize_remote() {
+  local profile="$1"
+  load_profile "$profile"
+  section "Remote optimization: $profile (${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT})"
+
+  if ! remote_admin_ssh "$profile" "true"; then
+    die "Cannot reach remote with key auth. Create/repair the profile first."
+  fi
+
+  local SUDO=""
+  if [[ "$REMOTE_USER" != "root" ]]; then
+    if remote_admin_ssh "$profile" "command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null"; then
+      SUDO="sudo "
+    else
+      warn "Remote user is not root and passwordless sudo is unavailable."
+      warn "Skipping remote tuning. Re-run with a root profile or grant sudo."
+      return 1
+    fi
+  fi
+
+  # Push config bodies as base64 to avoid heredoc nesting/quoting pitfalls.
+  local sysctl_b64 sshd_b64
+  sysctl_b64="$(print_sysctl_tuning | base64_nowrap)"
+  sshd_b64="$(print_sshd_tuning | base64_nowrap)"
+
+  # Remote tuning: identical sysctl (BBR/fq + big buffers), an sshd drop-in for
+  # keepalive + connection limits, and a systemd drop-in raising LimitNOFILE for
+  # the ssh daemon. sshd config is validated with `sshd -t` before any reload.
+  # Restarting sshd does NOT drop established tunnels (forked sessions survive),
+  # so it is safe and is required for the new LimitNOFILE to take effect.
+  local remote_script
+  remote_script="$(cat <<EOF
+set -e
+b64d() { base64 -d 2>/dev/null || base64 --decode; }
+${SUDO}mkdir -p /etc/sysctl.d /etc/ssh/sshd_config.d /etc/modules-load.d
+
+printf %s '${sysctl_b64}' | b64d | ${SUDO}tee ${REMOTE_SYSCTL_FILE} >/dev/null
+echo tcp_bbr | ${SUDO}tee /etc/modules-load.d/ssh-tun-bbr.conf >/dev/null
+${SUDO}modprobe tcp_bbr 2>/dev/null || true
+${SUDO}sysctl --system >/dev/null 2>&1 || true
+
+printf %s '${sshd_b64}' | b64d | ${SUDO}tee ${REMOTE_SSHD_DROPIN} >/dev/null
+
+# Detect the ssh daemon unit and raise its open-file limit via a systemd drop-in.
+SVC=""
+if command -v systemctl >/dev/null 2>&1; then
+  for s in ssh sshd; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^\${s}.service"; then SVC="\$s"; break; fi
+  done
+  if [ -n "\$SVC" ]; then
+    ${SUDO}mkdir -p /etc/systemd/system/\${SVC}.service.d
+    printf '[Service]\nLimitNOFILE=${NOFILE_LIMIT}\n' | ${SUDO}tee /etc/systemd/system/\${SVC}.service.d/99-ssh-tun.conf >/dev/null
+    ${SUDO}systemctl daemon-reload 2>/dev/null || true
+  fi
+fi
+
+if ${SUDO}sshd -t 2>/tmp/ssh-tun-sshd-test; then
+  if [ -n "\$SVC" ]; then
+    ${SUDO}systemctl restart "\$SVC" 2>/dev/null || ${SUDO}systemctl reload "\$SVC" 2>/dev/null || true
+  else
+    ${SUDO}service ssh restart 2>/dev/null || ${SUDO}service sshd restart 2>/dev/null || true
+  fi
+  echo "REMOTE_OK cc=\$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=\$(sysctl -n net.core.default_qdisc 2>/dev/null) svc=\${SVC:-service}"
+else
+  ${SUDO}rm -f ${REMOTE_SSHD_DROPIN}
+  echo "REMOTE_SSHD_INVALID"
+  cat /tmp/ssh-tun-sshd-test
+  exit 1
+fi
+EOF
+)"
+
+  local out
+  if out="$(remote_admin_ssh "$profile" "$remote_script" 2>&1)"; then
+    echo "$out"
+    ok "Remote optimization applied to $profile."
+  else
+    echo "$out" >&2
+    die "Remote optimization failed for $profile (sshd config left unchanged)."
+  fi
+}
+
 install_cli() {
   need_root
   ensure_dirs
@@ -1103,6 +1366,8 @@ main_menu() {
     echo "  8) Profile status"
     echo "  9) Profile logs (follow)"
     echo "  10) Install command to /usr/local/bin/ssh-tun"
+    echo "  11) Optimize THIS server (network/sysctl/limits)"
+    echo "  12) Optimize REMOTE server of a profile (sshd/sysctl)"
     echo "  0) Exit"
     echo
     echo "Tip: for profile actions, type 'b' to go back to this menu."
@@ -1140,6 +1405,11 @@ main_menu() {
         [[ -n "$profile" ]] && ( show_profile_logs "$profile" "YES" ) || true
         ;;
       10) ( install_cli ) || true ;;
+      11) ( optimize_local ) || true ;;
+      12)
+        profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( optimize_remote "$profile" ) || true
+        ;;
       0) break ;;
       *) warn "Invalid option." ;;
     esac
@@ -1164,6 +1434,8 @@ Usage:
   ssh-tun delete <profile>       # remove profile and units
   ssh-tun status <profile>       # show detailed status
   ssh-tun logs <profile> [--follow]
+  ssh-tun optimize-local         # tune THIS host (BBR/fq, buffers, nofile)
+  ssh-tun optimize-remote <profile>  # tune the remote endpoint (sshd/sysctl)
 EOF
 }
 
@@ -1190,6 +1462,8 @@ main() {
         show_profile_logs "$1" "NO"
       fi
       ;;
+    optimize-local) shift; optimize_local ;;
+    optimize-remote) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; optimize_remote "$1" ;;
     -h|--help|help) usage ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac
