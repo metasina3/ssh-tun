@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.3.0"
+VERSION="v9.4.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -1810,6 +1810,132 @@ install_cli() {
   ok "Run: ssh-tun"
 }
 
+list_profile_names() {
+  local -a names=() env_file
+  shopt -s nullglob
+  for env_file in "$PROFILES_DIR"/*.env; do
+    names+=("$(basename "$env_file" .env)")
+  done
+  shopt -u nullglob
+  ((${#names[@]} > 0)) && printf '%s\n' "${names[@]}"
+}
+
+clean_ssh_config_entries() {
+  local cfg="$SSH_CONFIG_FILE" tmp
+  [[ -f "$cfg" ]] || return 0
+  tmp="$(mktemp)"
+  awk '
+    /^# >>> ssh-tun / { drop = 1; next }
+    /^# <<< ssh-tun / { drop = 0; next }
+    drop == 0 { print }
+  ' "$cfg" >"$tmp"
+  mv "$tmp" "$cfg"
+  chmod 600 "$cfg" 2>/dev/null || true
+}
+
+stop_orphan_ssh_tun_units() {
+  local unit farm f
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done < <(systemctl list-unit-files 'ssh-tun@*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+  shopt -s nullglob
+  for f in /etc/systemd/system/ssh-tun-farm-*.service; do
+    systemctl disable --now "$(basename "$f")" >/dev/null 2>&1 || true
+    rm -f "$f" "${f}.d/wants.conf"
+    rmdir "${f}.d" >/dev/null 2>&1 || true
+  done
+  shopt -u nullglob
+}
+
+remove_local_tuning_files() {
+  rm -f "$LOCAL_SYSCTL_FILE" "$LOCAL_LIMITS_FILE" /etc/modules-load.d/ssh-tun-bbr.conf
+  if have_cmd sysctl; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_uninstall() {
+  local auto_yes="NO" keep_tuning="NO" clean_ssh="NO" ask tuning_ask ssh_ask
+  local -a profiles=() profile env_file
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) auto_yes="YES"; shift ;;
+      --keep-tuning) keep_tuning="YES"; shift ;;
+      --clean-ssh-config) clean_ssh="YES"; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  need_root
+  section "Uninstall ${APP_NAME} from this server"
+
+  mapfile -t profiles < <(list_profile_names || true)
+
+  echo "This will stop all SSH tunnel services and remove ${APP_NAME} from this host."
+  echo
+  if (( ${#profiles[@]} > 0 )); then
+    echo "  Profiles (${#profiles[@]}): ${profiles[*]}"
+  else
+    echo "  Profiles: (none)"
+  fi
+  echo "  Remove: ${BIN_PATH}"
+  echo "          ${LIBEXEC_DIR}/"
+  echo "          ${BASE_DIR}/"
+  echo "          ${SYSTEMD_TEMPLATE}"
+  echo "          all ssh-tun@*.service and ssh-tun-farm-*.service units"
+  echo
+  echo "  SSH private keys in ${ROOT_SSH_DIR} are kept (not deleted)."
+  echo
+
+  if [[ "$auto_yes" != "YES" ]]; then
+    prompt_yesno "Proceed with uninstall?" "NO" ask
+    [[ "$ask" == "YES" ]] || { log "Uninstall cancelled."; return 0; }
+  fi
+
+  if [[ "$keep_tuning" != "YES" ]]; then
+    if [[ "$auto_yes" != "YES" ]]; then
+      prompt_yesno "Also remove local network tuning files (sysctl/limits/BBR module load)?" "NO" tuning_ask
+      [[ "$tuning_ask" == "YES" ]] && keep_tuning="NO" || keep_tuning="YES"
+    fi
+  fi
+
+  if [[ "$clean_ssh" != "YES" && "$auto_yes" != "YES" ]]; then
+    prompt_yesno "Remove ssh-tun Host blocks from ${SSH_CONFIG_FILE}?" "NO" ssh_ask
+    [[ "$ssh_ask" == "YES" ]] && clean_ssh="YES"
+  fi
+
+  log "Stopping and removing profiles..."
+  for profile in "${profiles[@]}"; do
+    remove_profile "$profile" 2>/dev/null || true
+  done
+
+  stop_orphan_ssh_tun_units
+
+  log "Removing program files..."
+  rm -f "$BIN_PATH" "$SYSTEMD_TEMPLATE" "$UPDATE_CACHE_FILE"
+  rm -rf "$LIBEXEC_DIR" "$BASE_DIR"
+
+  if [[ "$keep_tuning" != "YES" ]]; then
+    log "Removing local tuning files..."
+    remove_local_tuning_files
+  else
+    log "Keeping local tuning files (${LOCAL_SYSCTL_FILE}, ${LOCAL_LIMITS_FILE})."
+  fi
+
+  if [[ "$clean_ssh" == "YES" ]]; then
+    clean_ssh_config_entries
+    ok "Removed ssh-tun entries from ${SSH_CONFIG_FILE}."
+  fi
+
+  systemd_reload
+  ok "Uninstall complete. ${APP_NAME} has been removed from this server."
+  if [[ "$SCRIPT_PATH" == "$BIN_PATH" ]]; then
+    log "This shell was running the installed binary; the command 'ssh-tun' is no longer available."
+  fi
+}
+
 cmd_doctor() {
   need_root
   ensure_dirs
@@ -1856,6 +1982,7 @@ main_menu() {
     echo "  11) Optimize THIS server (network/sysctl/limits)"
     echo "  12) Optimize REMOTE server of a profile (sshd/sysctl)"
     echo "  13) Update program from GitHub (optional)"
+    echo "  14) Uninstall ssh-tun from this server"
     echo "  0) Exit"
     echo
     echo "Tip: for profile actions, type 'b' to go back to this menu."
@@ -1899,6 +2026,7 @@ main_menu() {
         [[ -n "$profile" ]] && ( optimize_remote "$profile" ) || true
         ;;
       13) ( cmd_self_update ) || true ;;
+      14) ( cmd_uninstall ) || true ;;
       0) break ;;
       *) warn "Invalid option." ;;
     esac
@@ -1927,6 +2055,7 @@ Usage:
   ssh-tun optimize-remote <profile>  # tune the remote endpoint (sshd/sysctl)
   ssh-tun check-update           # check GitHub for a newer version (optional)
   ssh-tun self-update [--yes]    # download and install latest from GitHub (optional)
+  ssh-tun uninstall [--yes] [--keep-tuning] [--clean-ssh-config]
 EOF
 }
 
@@ -1957,6 +2086,7 @@ main() {
     optimize-remote) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; optimize_remote "$1" ;;
     check-update) shift; cmd_check_update ;;
     self-update) shift; cmd_self_update "$@" ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
     -h|--help|help) usage ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac

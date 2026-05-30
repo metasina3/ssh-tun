@@ -44,6 +44,7 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Multi-public-IP rotation** – when the local host has several public IPv4 addresses, each tunnel automatically picks one (`ssh BindAddress`), rotates on connect/health failures, and refreshes the IP pool when addresses are added or removed.
 - **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
 - **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 13); failures are non-fatal if GitHub is unreachable.
+- **Full server uninstall** – remove all profiles, units, and installed files from the host (`uninstall`, menu option 14); optional retention of tuning files and cleanup of SSH config entries.
 - **Single file, no dependencies to build** – just a Bash script.
 
 ## How it works
@@ -144,6 +145,7 @@ Options:
   11) Optimize THIS server (network/sysctl/limits)
   12) Optimize REMOTE server of a profile (sshd/sysctl)
   13) Update program from GitHub (optional)
+  14) Uninstall ssh-tun from this server
   0) Exit
 ```
 
@@ -165,6 +167,7 @@ ssh-tun optimize-local           # tune THIS host (BBR/fq, buffers, nofile)
 ssh-tun optimize-remote <profile> # tune the remote endpoint (sshd/sysctl)
 ssh-tun check-update           # check GitHub for a newer version (optional)
 ssh-tun self-update [--yes]    # install latest script from GitHub (optional)
+ssh-tun uninstall [--yes] [--keep-tuning] [--clean-ssh-config]  # remove tool from this host
 ```
 
 ## Profiles
@@ -313,17 +316,35 @@ journalctl -u 'ssh-tun@myserver__1660.service' -f
 
 ## Uninstall
 
-```bash
-# Remove a profile and its units
-sudo ssh-tun delete myserver
+From v9.4.0 you can remove **ssh-tun** entirely from the local server with one command (or menu option **14**). This stops all tunnel services, deletes profiles and program files, and reloads `systemd`. SSH private keys under `~/.ssh` are **not** deleted.
 
-# Remove the CLI and runtime assets
-sudo rm -f /usr/local/bin/ssh-tun
-sudo rm -rf /usr/local/libexec/ssh-tun /etc/ssh-tun
-sudo rm -f /etc/systemd/system/ssh-tun@.service
-sudo rm -f /etc/sysctl.d/99-ssh-tun.conf /etc/security/limits.d/99-ssh-tun.conf
-sudo systemctl daemon-reload
+```bash
+sudo ssh-tun uninstall
 ```
+
+Interactive prompts ask whether to remove local network tuning (sysctl/limits/BBR module load) and whether to strip `Host` blocks that ssh-tun added to `~/.ssh/config`.
+
+**Menu:** option **14) Uninstall ssh-tun from this server**
+
+**Flags:**
+
+| Flag | Effect |
+| --- | --- |
+| `--yes` / `-y` | Skip the main confirmation (tuning and SSH-config prompts still appear unless other flags apply) |
+| `--keep-tuning` | Leave `/etc/sysctl.d/99-ssh-tun.conf`, `/etc/security/limits.d/99-ssh-tun.conf`, and related tuning in place |
+| `--clean-ssh-config` | Remove ssh-tun `Host` entries from the SSH config without prompting |
+
+Examples:
+
+```bash
+sudo ssh-tun uninstall --yes
+sudo ssh-tun uninstall --yes --keep-tuning
+sudo ssh-tun uninstall --yes --clean-ssh-config
+```
+
+To remove only one remote profile (not the whole tool), use `ssh-tun delete <profile>` instead.
+
+
 
 ## License
 
