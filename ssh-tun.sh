@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.2.0"
+VERSION="v9.3.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
 BIN_PATH="/usr/local/bin/ssh-tun"
+GITHUB_REPO="metasina3/ssh-tun"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/ssh-tun.sh"
+GITHUB_API_LATEST="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+UPDATE_CACHE_TTL=3600
+UPDATE_FAIL_CACHE_TTL=600
 BASE_DIR="/etc/ssh-tun"
+UPDATE_CACHE_FILE="${BASE_DIR}/.update-check"
 PROFILES_DIR="${BASE_DIR}/profiles"
 LIBEXEC_DIR="/usr/local/libexec/ssh-tun"
 SUPERVISOR_PATH="${LIBEXEC_DIR}/supervisor.sh"
@@ -158,6 +164,207 @@ ensure_dirs() {
   chmod 700 "$ROOT_SSH_DIR"
   touch "$KNOWN_HOSTS_FILE_DEFAULT" "$SSH_CONFIG_FILE"
   chmod 600 "$KNOWN_HOSTS_FILE_DEFAULT" "$SSH_CONFIG_FILE" || true
+}
+
+# --- Optional self-update from GitHub (never mandatory; failures are silent) ---
+UPDATE_CHECK_OK="NO"
+UPDATE_AVAILABLE="NO"
+UPDATE_LATEST_VERSION=""
+
+_version_key() {
+  local v="${1#v}" a b c
+  IFS=. read -r a b c <<< "$v"
+  a=${a:-0}; b=${b:-0}; c=${c:-0}
+  printf '%010d%010d%010d' "$a" "$b" "$c"
+}
+
+version_newer_than() {
+  [[ "$(_version_key "$1")" -gt "$(_version_key "$2")" ]]
+}
+
+_fetch_latest_version_remote() {
+  local tag ver
+  if have_cmd curl; then
+    tag="$(curl -fsSL --connect-timeout 5 --max-time 10 \
+      -H "Accept: application/vnd.github+json" \
+      "$GITHUB_API_LATEST" 2>/dev/null \
+      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || true
+    if [[ -n "$tag" ]]; then
+      printf '%s' "$tag"
+      return 0
+    fi
+    ver="$(curl -fsSL --connect-timeout 5 --max-time 20 "$GITHUB_RAW_URL" 2>/dev/null \
+      | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1)" || true
+    if [[ -n "$ver" ]]; then
+      printf '%s' "$ver"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_save_update_cache() {
+  local now
+  now="$(date +%s)"
+  mkdir -p "$BASE_DIR"
+  cat >"$UPDATE_CACHE_FILE" <<EOF
+LAST_CHECK_EPOCH=${now}
+UPDATE_CHECK_OK=${UPDATE_CHECK_OK}
+UPDATE_AVAILABLE=${UPDATE_AVAILABLE}
+UPDATE_LATEST_VERSION=${UPDATE_LATEST_VERSION}
+EOF
+  chmod 0644 "$UPDATE_CACHE_FILE" 2>/dev/null || true
+}
+
+_load_update_cache() {
+  local now age epoch
+  [[ -r "$UPDATE_CACHE_FILE" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$UPDATE_CACHE_FILE" 2>/dev/null || return 1
+  now="$(date +%s)"
+  epoch="${LAST_CHECK_EPOCH:-0}"
+  age=$((now - epoch))
+  if [[ "${UPDATE_CHECK_OK:-NO}" == "NO" ]]; then
+    (( age >= 0 && age < UPDATE_FAIL_CACHE_TTL )) || return 1
+  else
+    (( age >= 0 && age < UPDATE_CACHE_TTL )) || return 1
+  fi
+  UPDATE_CHECK_OK="${UPDATE_CHECK_OK:-NO}"
+  UPDATE_AVAILABLE="${UPDATE_AVAILABLE:-NO}"
+  UPDATE_LATEST_VERSION="${UPDATE_LATEST_VERSION:-}"
+  return 0
+}
+
+# Check GitHub for a newer release. Returns 0 when check succeeded (even if up-to-date).
+# Never prints errors — callers decide what to show.
+check_for_update() {
+  local latest
+  UPDATE_CHECK_OK="NO"
+  UPDATE_AVAILABLE="NO"
+  UPDATE_LATEST_VERSION=""
+
+  if _load_update_cache; then
+    [[ "${UPDATE_CHECK_OK:-NO}" == "YES" ]]
+    return $?
+  fi
+
+  latest="$(_fetch_latest_version_remote)" || {
+    UPDATE_CHECK_OK="NO"
+    UPDATE_AVAILABLE="NO"
+    UPDATE_LATEST_VERSION=""
+    _save_update_cache
+    return 1
+  }
+
+  UPDATE_CHECK_OK="YES"
+  UPDATE_LATEST_VERSION="$latest"
+  if version_newer_than "$latest" "$VERSION"; then
+    UPDATE_AVAILABLE="YES"
+  else
+    UPDATE_AVAILABLE="NO"
+  fi
+  _save_update_cache
+  return 0
+}
+
+maybe_show_update_notice() {
+  check_for_update >/dev/null 2>&1 || return 0
+  if [[ "$UPDATE_AVAILABLE" == "YES" && -n "$UPDATE_LATEST_VERSION" ]]; then
+    echo
+    echo "  >>> Update available: ${VERSION} -> ${UPDATE_LATEST_VERSION}  (option 13: update program from GitHub)"
+  fi
+}
+
+cmd_check_update() {
+  need_root
+  ensure_dirs
+  section "Program update check"
+  if ! check_for_update; then
+    log "Could not reach GitHub (optional check). Current version: ${VERSION}"
+    log "You can continue using the program normally."
+    return 0
+  fi
+  if [[ "$UPDATE_AVAILABLE" == "YES" ]]; then
+    ok "New version available: ${UPDATE_LATEST_VERSION} (installed: ${VERSION})"
+    log "Run: ssh-tun self-update   or choose menu option 13"
+  else
+    ok "You are on the latest known version (${VERSION})."
+  fi
+}
+
+cmd_self_update() {
+  local auto_yes="NO" ask tmp new_ver dl_ok
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) auto_yes="YES"; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  need_root
+  ensure_dirs
+  have_cmd curl || { warn "curl is required for self-update. Current version ${VERSION} unchanged."; return 0; }
+
+  section "Update program from GitHub"
+
+  if ! check_for_update; then
+    warn "Could not reach GitHub. Update skipped; current version ${VERSION} is unchanged."
+    log "This is optional — the program continues to work normally."
+    return 0
+  fi
+
+  if [[ "$UPDATE_AVAILABLE" != "YES" ]]; then
+    ok "Already up to date (${VERSION})."
+    return 0
+  fi
+
+  log "Downloading latest script from GitHub (${UPDATE_LATEST_VERSION})..."
+  tmp="$(mktemp)"
+  dl_ok="NO"
+  if curl -fsSL --connect-timeout 10 --max-time 90 "$GITHUB_RAW_URL" -o "$tmp" 2>/dev/null; then
+    dl_ok="YES"
+  fi
+  if [[ "$dl_ok" != "YES" ]]; then
+    warn "Download failed (GitHub unreachable?). Current version ${VERSION} unchanged."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  new_ver="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -1)"
+  if [[ -z "$new_ver" ]] || ! bash -n "$tmp" 2>/dev/null; then
+    warn "Downloaded file looks invalid. Update aborted; keeping ${VERSION}."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if [[ "$auto_yes" != "YES" ]]; then
+    prompt_yesno "Install update ${VERSION} -> ${new_ver}?" "YES" ask
+    if [[ "$ask" != "YES" ]]; then
+      log "Update skipped."
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+
+  install -m 0755 "$tmp" "$BIN_PATH"
+  if [[ "$SCRIPT_PATH" != "$BIN_PATH" && -e "$SCRIPT_PATH" ]]; then
+    install -m 0755 "$tmp" "$SCRIPT_PATH" 2>/dev/null || true
+  fi
+  rm -f "$tmp"
+
+  # Refresh runtime assets from the new script (supervisor + systemd template).
+  write_supervisor
+  write_systemd_template
+  systemd_reload
+
+  UPDATE_CHECK_OK="YES"
+  UPDATE_AVAILABLE="NO"
+  UPDATE_LATEST_VERSION="$new_ver"
+  _save_update_cache
+
+  ok "Updated to ${new_ver} at ${BIN_PATH}"
+  log "Re-run 'ssh-tun' to use the new version in this shell."
+  log "Optional: ssh-tun doctor  or  ssh-tun update <profile>  to refresh running tunnels."
 }
 
 ensure_apt() {
@@ -1633,6 +1840,7 @@ main_menu() {
   while true; do
     section "${APP_NAME} ${VERSION}"
     show_prereq_table
+    maybe_show_update_notice
     echo
     echo "Options:"
     echo "  1) Install/upgrade prerequisites"
@@ -1647,6 +1855,7 @@ main_menu() {
     echo "  10) Install command to /usr/local/bin/ssh-tun"
     echo "  11) Optimize THIS server (network/sysctl/limits)"
     echo "  12) Optimize REMOTE server of a profile (sshd/sysctl)"
+    echo "  13) Update program from GitHub (optional)"
     echo "  0) Exit"
     echo
     echo "Tip: for profile actions, type 'b' to go back to this menu."
@@ -1689,6 +1898,7 @@ main_menu() {
         profile="$(choose_profile_interactive || true)"
         [[ -n "$profile" ]] && ( optimize_remote "$profile" ) || true
         ;;
+      13) ( cmd_self_update ) || true ;;
       0) break ;;
       *) warn "Invalid option." ;;
     esac
@@ -1715,6 +1925,8 @@ Usage:
   ssh-tun logs <profile> [--follow]
   ssh-tun optimize-local         # tune THIS host (BBR/fq, buffers, nofile)
   ssh-tun optimize-remote <profile>  # tune the remote endpoint (sshd/sysctl)
+  ssh-tun check-update           # check GitHub for a newer version (optional)
+  ssh-tun self-update [--yes]    # download and install latest from GitHub (optional)
 EOF
 }
 
@@ -1743,6 +1955,8 @@ main() {
       ;;
     optimize-local) shift; optimize_local ;;
     optimize-remote) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; optimize_remote "$1" ;;
+    check-update) shift; cmd_check_update ;;
+    self-update) shift; cmd_self_update "$@" ;;
     -h|--help|help) usage ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac

@@ -15,6 +15,7 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Installation](#installation)
+- [Optional self-update](#optional-self-update)
 - [Usage](#usage)
   - [Interactive menu](#interactive-menu)
   - [CLI commands](#cli-commands)
@@ -42,6 +43,7 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Max-bandwidth optimization** – one command applies BBR + `fq`, large TCP buffers, and high file-descriptor limits on **both** the local host and the remote server (with `sshd -t` validation before reload).
 - **Multi-public-IP rotation** – when the local host has several public IPv4 addresses, each tunnel automatically picks one (`ssh BindAddress`), rotates on connect/health failures, and refreshes the IP pool when addresses are added or removed.
 - **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
+- **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 13); failures are non-fatal if GitHub is unreachable.
 - **Single file, no dependencies to build** – just a Bash script.
 
 ## How it works
@@ -107,6 +109,16 @@ sudo ./ssh-tun.sh           # interactive menu
 sudo ./ssh-tun.sh create myserver
 ```
 
+## Optional self-update
+
+From v9.3.0 onward you can optionally pull newer releases from this GitHub repository. Updates are **never required** — if GitHub is unreachable, the tool keeps running at your installed version with no error spam.
+
+- **Menu:** option **13) Update program from GitHub (optional)**
+- **CLI:** `ssh-tun check-update` — query GitHub (API or raw script) for a newer tag
+- **CLI:** `ssh-tun self-update` — download and install the latest script to `/usr/local/bin/ssh-tun` (use `--yes` to skip confirmation)
+
+The interactive menu may show a one-line notice when a newer version is available. Failed checks are cached briefly so offline hosts are not hammered.
+
 ## Usage
 
 ### Interactive menu
@@ -131,6 +143,7 @@ Options:
   10) Install command to /usr/local/bin/ssh-tun
   11) Optimize THIS server (network/sysctl/limits)
   12) Optimize REMOTE server of a profile (sshd/sysctl)
+  13) Update program from GitHub (optional)
   0) Exit
 ```
 
@@ -150,6 +163,8 @@ ssh-tun status <profile>         # show detailed status
 ssh-tun logs <profile> [--follow]
 ssh-tun optimize-local           # tune THIS host (BBR/fq, buffers, nofile)
 ssh-tun optimize-remote <profile> # tune the remote endpoint (sshd/sysctl)
+ssh-tun check-update           # check GitHub for a newer version (optional)
+ssh-tun self-update [--yes]    # install latest script from GitHub (optional)
 ```
 
 ## Profiles
