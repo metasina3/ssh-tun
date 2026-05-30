@@ -40,6 +40,8 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Profiles** – named, editable configurations for different remote servers; create/update/enable/disable/delete from a menu or CLI.
 - **Automatic key setup** – generates an `ed25519` key and installs it on the remote via password auth (one-time), then switches to key-only auth.
 - **Max-bandwidth optimization** – one command applies BBR + `fq`, large TCP buffers, and high file-descriptor limits on **both** the local host and the remote server (with `sshd -t` validation before reload).
+- **Multi-public-IP rotation** – when the local host has several public IPv4 addresses, each tunnel automatically picks one (`ssh BindAddress`), rotates on connect/health failures, and refreshes the IP pool when addresses are added or removed.
+- **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
 - **Single file, no dependencies to build** – just a Bash script.
 
 ## How it works
@@ -185,6 +187,28 @@ Watch it live:
 ssh-tun logs myserver --follow
 ssh-tun status myserver
 ```
+
+Default health URLs (first = highest priority): `https://www.google.com/generate_204`, gstatic, Cloudflare trace, Telegram, plus HTTP fallbacks.
+
+### Outbound public IP rotation (auto)
+
+If your local server has **more than one public IPv4**, each tunnel instance automatically:
+
+1. Detects global addresses (`ip -4 addr show scope global`).
+2. Picks one at random per instance (`ssh -o BindAddress=…`) to spread load across all IPs.
+3. Retries other IPs in a loop when SSH connect or SOCKS health check fails (with timeout).
+4. Switches to another IP after **3 consecutive health-check failures** on the current IP (configurable).
+5. Refreshes the IP list every **60 seconds** and logs when addresses are added or removed.
+
+Profile env keys (optional, defaults shown):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SOURCE_IP_MODE` | `auto` | `auto` = detect public IPs; `none` = no BindAddress; `manual` = use `SOURCE_IPS` |
+| `SOURCE_IPS` | *(empty)* | Comma list when mode is `manual` |
+| `SOURCE_IP_REFRESH` | `60` | Seconds between IP pool rescans |
+| `SOURCE_IP_CONNECT_TIMEOUT` | `12` | Seconds to wait for SSH+SOCKS to come up |
+| `SOURCE_IP_FAILS_TO_SWITCH` | `3` | Health failures before switching to another IP |
 
 ## Performance tuning
 

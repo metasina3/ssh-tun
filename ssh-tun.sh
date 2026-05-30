@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.1.0"
+VERSION="v9.2.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -20,6 +20,10 @@ KNOWN_HOSTS_FILE_DEFAULT="${ROOT_SSH_DIR}/known_hosts"
 SSH_CONFIG_FILE="${ROOT_SSH_DIR}/config"
 
 PREREQ_PKGS=(openssh-client curl iproute2 ca-certificates)
+
+# Health-check endpoints (first = highest priority). Google generate_204 first,
+# then gstatic, Cloudflare trace, Telegram, legacy HTTP fallbacks.
+DEFAULT_HC_URLS="https://www.google.com/generate_204,https://connectivitycheck.gstatic.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace,https://telegram.org/,http://clients3.google.com/generate_204,http://www.msftconnecttest.com/connecttest.txt"
 
 log()  { echo "[INFO] $*"; }
 ok()   { echo "[OK] $*"; }
@@ -258,13 +262,28 @@ mkdir -p "$(dirname "$KNOWN_HOSTS_FILE")"
 touch "$KNOWN_HOSTS_FILE"
 chmod 600 "$KNOWN_HOSTS_FILE" || true
 
-HC_URLS="${HC_URLS:-http://clients3.google.com/generate_204,http://connectivitycheck.gstatic.com/generate_204,http://www.msftconnecttest.com/connecttest.txt}"
+HC_URLS="${HC_URLS:-https://www.google.com/generate_204,https://connectivitycheck.gstatic.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace,https://telegram.org/,http://clients3.google.com/generate_204,http://www.msftconnecttest.com/connecttest.txt}"
 HC_TIMEOUT="${HC_TIMEOUT:-5}"
 HC_RETRIES="${HC_RETRIES:-2}"
 HC_INTERVAL="${HC_INTERVAL:-15}"
 HC_FAILS_TO_RESTART="${HC_FAILS_TO_RESTART:-3}"
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-20}"
 DEBUG_HEALTHCHECK="${DEBUG_HEALTHCHECK:-NO}"
+
+SOURCE_IP_MODE="${SOURCE_IP_MODE:-auto}"
+SOURCE_IPS_MANUAL="${SOURCE_IPS:-}"
+SOURCE_IP_REFRESH="${SOURCE_IP_REFRESH:-60}"
+SOURCE_IP_CONNECT_TIMEOUT="${SOURCE_IP_CONNECT_TIMEOUT:-12}"
+SOURCE_IP_FAILS_TO_SWITCH="${SOURCE_IP_FAILS_TO_SWITCH:-3}"
+
+PUBLIC_IPS=()
+PUBLIC_IPS_CSV=""
+CURRENT_SOURCE_IP=""
+LAST_IP_REFRESH=0
+SSH_OPTS=()
+DYNF=()
+PROBE_HOST="127.0.0.1"
+SWITCH_SOURCE=0
 
 ipv6_stack_available() { [[ -e /proc/net/if_inet6 ]]; }
 
@@ -281,65 +300,141 @@ ipv6_loopback_available() {
   [[ "$(cat "$d" 2>/dev/null)" == "0" ]]
 }
 
-# Build the list of -D (dynamic SOCKS) bind specs and the address used by the
-# health check. Loopback ("127.0.0.1"/"localhost"/"loopback"/"both"/empty)
-# listens on BOTH IPv4 127.0.0.1 and IPv6 ::1 by default. ::1 is only added
-# when IPv6 loopback is actually available, otherwise ExitOnForwardFailure=yes
-# would tear the tunnel down on IPv6-disabled hosts.
-DYNF=()
-PROBE_HOST="127.0.0.1"
-case "$BIND_ADDR" in
-  127.0.0.1|localhost|loopback|both|dual|"")
-    DYNF+=(-D "127.0.0.1:${SOCKS_PORT}")
-    if ipv6_loopback_available; then DYNF+=(-D "[::1]:${SOCKS_PORT}"); fi
-    PROBE_HOST="127.0.0.1"
-    ;;
-  0.0.0.0|any|all|"*")
-    DYNF+=(-D "0.0.0.0:${SOCKS_PORT}")
-    if ipv6_stack_available; then DYNF+=(-D "[::]:${SOCKS_PORT}"); fi
-    PROBE_HOST="127.0.0.1"
-    ;;
-  ::1)
-    DYNF+=(-D "[::1]:${SOCKS_PORT}")
-    PROBE_HOST="[::1]"
-    ;;
-  ::)
-    DYNF+=(-D "[::]:${SOCKS_PORT}")
-    PROBE_HOST="[::1]"
-    ;;
-  *:*)
-    DYNF+=(-D "[${BIND_ADDR}]:${SOCKS_PORT}")
-    PROBE_HOST="[${BIND_ADDR}]"
-    ;;
-  *)
-    DYNF+=(-D "${BIND_ADDR}:${SOCKS_PORT}")
-    PROBE_HOST="${BIND_ADDR}"
-    ;;
-esac
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^127\. ]] && return 0
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
+  return 1
+}
 
-SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
-SSH_OPTS=(
-  -F /dev/null
-  -N
-  "${DYNF[@]}"
-  -p "${REMOTE_PORT}"
-  -i "${KEY_PATH}"
-  -o "IdentitiesOnly=yes"
-  -o "Compression=no"
-  -o "IPQoS=throughput"
-  -o "Ciphers=${CIPHERS}"
-  -o "RekeyLimit=${REKEY_LIMIT}"
-  -o "ExitOnForwardFailure=yes"
-  -o "ServerAliveInterval=${SERVER_ALIVE_INTERVAL}"
-  -o "ServerAliveCountMax=${SERVER_ALIVE_COUNTMAX}"
-  -o "TCPKeepAlive=yes"
-  -o "GSSAPIAuthentication=no"
-  -o "StrictHostKeyChecking=accept-new"
-  -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
-  -o "ConnectTimeout=10"
-  -o "BatchMode=yes"
-  -o "LogLevel=ERROR"
-)
+# Discover global (public) IPv4 addresses, or use a manual list from the profile.
+refresh_public_ips() {
+  local -a found=() manual=() ip old_csv
+  old_csv="$PUBLIC_IPS_CSV"
+  found=()
+
+  if [[ -n "${SOURCE_IPS_MANUAL// /}" && "$SOURCE_IP_MODE" != "auto" ]]; then
+    IFS=',' read -r -a manual <<< "${SOURCE_IPS_MANUAL// /}"
+    for ip in "${manual[@]}"; do
+      [[ -n "$ip" ]] || continue
+      found+=("$ip")
+    done
+  elif [[ "$SOURCE_IP_MODE" != "none" ]]; then
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] || continue
+      is_private_ipv4 "$ip" && continue
+      found+=("$ip")
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u)
+  fi
+
+  PUBLIC_IPS=("${found[@]}")
+  if (( ${#PUBLIC_IPS[@]} > 0 )); then
+    PUBLIC_IPS_CSV="$(IFS=,; echo "${PUBLIC_IPS[*]}")"
+  else
+    PUBLIC_IPS_CSV=""
+  fi
+  LAST_IP_REFRESH=$SECONDS
+
+  if [[ "$PUBLIC_IPS_CSV" != "$old_csv" && -n "$old_csv$PUBLIC_IPS_CSV" ]]; then
+    log "public IP pool changed: was=[${old_csv:-none}] now=[${PUBLIC_IPS_CSV:-none}] instance=$INSTANCE"
+  fi
+}
+
+maybe_refresh_public_ips() {
+  (( SECONDS - LAST_IP_REFRESH >= SOURCE_IP_REFRESH )) || return 0
+  refresh_public_ips
+}
+
+# Pick a random outbound source IP, optionally excluding the current one.
+pick_source_ip() {
+  local exclude="${1:-}" pick idx
+  refresh_public_ips
+  if (( ${#PUBLIC_IPS[@]} == 0 )); then
+    CURRENT_SOURCE_IP=""
+    return 0
+  fi
+  if (( ${#PUBLIC_IPS[@]} == 1 )); then
+    CURRENT_SOURCE_IP="${PUBLIC_IPS[0]}"
+    return 0
+  fi
+  local -a pool=()
+  for ip in "${PUBLIC_IPS[@]}"; do
+    [[ "$ip" == "$exclude" ]] && continue
+    pool+=("$ip")
+  done
+  (( ${#pool[@]} > 0 )) || pool=("${PUBLIC_IPS[@]}")
+  idx=$((RANDOM % ${#pool[@]}))
+  CURRENT_SOURCE_IP="${pool[$idx]}"
+}
+
+build_dyn_forwards() {
+  DYNF=()
+  PROBE_HOST="127.0.0.1"
+  case "$BIND_ADDR" in
+    127.0.0.1|localhost|loopback|both|dual|"")
+      DYNF+=(-D "127.0.0.1:${SOCKS_PORT}")
+      if ipv6_loopback_available; then DYNF+=(-D "[::1]:${SOCKS_PORT}"); fi
+      PROBE_HOST="127.0.0.1"
+      ;;
+    0.0.0.0|any|all|"*")
+      DYNF+=(-D "0.0.0.0:${SOCKS_PORT}")
+      if ipv6_stack_available; then DYNF+=(-D "[::]:${SOCKS_PORT}"); fi
+      PROBE_HOST="127.0.0.1"
+      ;;
+    ::1)
+      DYNF+=(-D "[::1]:${SOCKS_PORT}")
+      PROBE_HOST="[::1]"
+      ;;
+    ::)
+      DYNF+=(-D "[::]:${SOCKS_PORT}")
+      PROBE_HOST="[::1]"
+      ;;
+    *:*)
+      DYNF+=(-D "[${BIND_ADDR}]:${SOCKS_PORT}")
+      PROBE_HOST="[${BIND_ADDR}]"
+      ;;
+    *)
+      DYNF+=(-D "${BIND_ADDR}:${SOCKS_PORT}")
+      PROBE_HOST="${BIND_ADDR}"
+      ;;
+  esac
+}
+
+build_ssh_opts() {
+  build_dyn_forwards
+  SSH_OPTS=(
+    -F /dev/null
+    -N
+    "${DYNF[@]}"
+    -p "${REMOTE_PORT}"
+    -i "${KEY_PATH}"
+    -o "IdentitiesOnly=yes"
+    -o "Compression=no"
+    -o "IPQoS=throughput"
+    -o "Ciphers=${CIPHERS}"
+    -o "RekeyLimit=${REKEY_LIMIT}"
+    -o "ExitOnForwardFailure=yes"
+    -o "ServerAliveInterval=${SERVER_ALIVE_INTERVAL}"
+    -o "ServerAliveCountMax=${SERVER_ALIVE_COUNTMAX}"
+    -o "TCPKeepAlive=yes"
+    -o "GSSAPIAuthentication=no"
+    -o "StrictHostKeyChecking=accept-new"
+    -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
+    -o "ConnectTimeout=${SOURCE_IP_CONNECT_TIMEOUT}"
+    -o "BatchMode=yes"
+    -o "LogLevel=ERROR"
+  )
+  if [[ -n "$CURRENT_SOURCE_IP" ]]; then
+    SSH_OPTS+=(-o "BindAddress=${CURRENT_SOURCE_IP}")
+  fi
+}
+
+socks_port_listening() {
+  ss -lntH "sport = :${SOCKS_PORT}" 2>/dev/null | grep -q .
+}
 
 probe_socks_http() {
   local endpoint code
@@ -356,16 +451,12 @@ probe_socks_http() {
       return 0
     fi
     if [[ "$DEBUG_HEALTHCHECK" == "YES" ]]; then
-      warn "HC endpoint failed: port=$SOCKS_PORT endpoint=$endpoint code=${code:-n/a}"
+      warn "HC endpoint failed: port=$SOCKS_PORT source=${CURRENT_SOURCE_IP:-default} endpoint=$endpoint code=${code:-n/a}"
     fi
   done
   return 1
 }
 
-# Start ssh as a DIRECT child of this supervisor and record its PID in the
-# global SSH_PID. Using a command substitution here (SSH_PID="$(...)") would run
-# ssh inside a subshell that immediately exits, orphaning ssh and breaking the
-# `wait "$SSH_PID"` below (you cannot wait on a non-child).
 SSH_PID=""
 start_ssh_bg() {
   if [[ "$PINNING" == "YES" && "$CORE" =~ ^[0-9]+$ ]]; then
@@ -376,55 +467,172 @@ start_ssh_bg() {
   SSH_PID=$!
 }
 
+wait_tunnel_ready() {
+  local deadline=$((SECONDS + SOURCE_IP_CONNECT_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$SSH_PID" >/dev/null 2>&1; then
+      return 1
+    fi
+    if socks_port_listening && probe_socks_http; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+kill_ssh() {
+  [[ -n "${SSH_PID:-}" ]] || return 0
+  kill "$SSH_PID" >/dev/null 2>&1 || true
+  wait "$SSH_PID" >/dev/null 2>&1 || true
+  SSH_PID=""
+}
+
+# Try each available public IP (shuffled) until SSH+SOCKS comes up or all fail.
+start_tunnel_with_source_rotation() {
+  local -a try_order=() ip i n old_random
+  SWITCH_SOURCE=0
+  refresh_public_ips
+
+  if (( ${#PUBLIC_IPS[@]} <= 1 )); then
+    if (( ${#PUBLIC_IPS[@]} == 1 )); then
+      CURRENT_SOURCE_IP="${PUBLIC_IPS[0]}"
+    else
+      CURRENT_SOURCE_IP=""
+    fi
+    build_ssh_opts
+    start_ssh_bg
+    if wait_tunnel_ready; then
+      log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=${CURRENT_SOURCE_IP:-default}"
+      return 0
+    fi
+    warn "tunnel failed: instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default}"
+    kill_ssh
+    return 1
+  fi
+
+  # Spread instances across IPs; re-shuffle on each full rotation pass.
+  old_random=$RANDOM
+  RANDOM=$(( (SOCKS_PORT * 9973 + ${#PROFILE_ID} * 17) % 32768 ))
+  try_order=("${PUBLIC_IPS[@]}")
+  for ((i=${#try_order[@]}-1; i>0; i--)); do
+    j=$((RANDOM % (i + 1)))
+    ip="${try_order[$i]}"
+    try_order[$i]="${try_order[$j]}"
+    try_order[$j]="$ip"
+  done
+  RANDOM=$old_random
+
+  if [[ -n "$CURRENT_SOURCE_IP" ]]; then
+    local -a rotated=()
+    for ip in "${try_order[@]}"; do
+      [[ "$ip" == "$CURRENT_SOURCE_IP" ]] && continue
+      rotated+=("$ip")
+    done
+    rotated+=("$CURRENT_SOURCE_IP")
+    try_order=("${rotated[@]}")
+  fi
+
+  n=${#try_order[@]}
+  for ((i=0; i<n; i++)); do
+    CURRENT_SOURCE_IP="${try_order[$i]}"
+    build_ssh_opts
+    start_ssh_bg
+    log "trying source=${CURRENT_SOURCE_IP} instance=$INSTANCE pid=$SSH_PID (${i+1}/${n})"
+    if wait_tunnel_ready; then
+      log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=$CURRENT_SOURCE_IP"
+      return 0
+    fi
+    warn "source failed: instance=$INSTANCE source=$CURRENT_SOURCE_IP"
+    kill_ssh
+  done
+
+  CURRENT_SOURCE_IP=""
+  build_ssh_opts
+  start_ssh_bg
+  log "fallback without BindAddress: instance=$INSTANCE pid=$SSH_PID"
+  if wait_tunnel_ready; then
+    log "tunnel started (no bind): profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID"
+    return 0
+  fi
+  kill_ssh
+  return 1
+}
+
 cleanup() {
   trap - TERM INT
-  if [[ -n "${SSH_PID:-}" ]]; then
-    kill "$SSH_PID" >/dev/null 2>&1 || true
-    wait "$SSH_PID" >/dev/null 2>&1 || true
-  fi
+  kill_ssh
   exit 0
 }
 trap cleanup TERM INT
 
+SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 FAILS=0
 HEARTBEAT_COUNT=0
 LAST_STATE="STARTING"
 
 while true; do
-  start_ssh_bg
+  if ! start_tunnel_with_source_rotation; then
+    warn "all source IPs failed for instance=$INSTANCE; retry in 5s"
+    sleep 5
+    continue
+  fi
+
   FAILS=0
   HEARTBEAT_COUNT=0
   LAST_STATE="UP"
-  log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID"
-  sleep 1
 
   while kill -0 "$SSH_PID" >/dev/null 2>&1; do
+    maybe_refresh_public_ips
+
     if probe_socks_http; then
       FAILS=0
       HEARTBEAT_COUNT=$((HEARTBEAT_COUNT + 1))
       if [[ "$LAST_STATE" != "UP" ]]; then
-        log "tunnel recovered: instance=$INSTANCE"
+        log "tunnel recovered: instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default}"
         LAST_STATE="UP"
       fi
       if (( HEARTBEAT_COUNT % HEARTBEAT_EVERY == 0 )); then
-        log "tunnel alive: instance=$INSTANCE pid=$SSH_PID"
+        log "tunnel alive: instance=$INSTANCE pid=$SSH_PID source=${CURRENT_SOURCE_IP:-default}"
       fi
     else
       FAILS=$((FAILS + 1))
       LAST_STATE="DEGRADED"
-      warn "healthcheck failed: instance=$INSTANCE (${FAILS}/${HC_FAILS_TO_RESTART})"
+      warn "healthcheck failed: instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default} (${FAILS}/${HC_FAILS_TO_RESTART})"
+
+      if (( FAILS >= SOURCE_IP_FAILS_TO_SWITCH && ${#PUBLIC_IPS[@]} > 1 )); then
+        warn "switching outbound source IP after ${FAILS} failures: instance=$INSTANCE was=${CURRENT_SOURCE_IP:-default}"
+        pick_source_ip "$CURRENT_SOURCE_IP"
+        kill_ssh
+        SWITCH_SOURCE=1
+        break
+      fi
+
       if (( FAILS >= HC_FAILS_TO_RESTART )); then
-        warn "healthcheck threshold reached; restarting instance=$INSTANCE"
-        kill "$SSH_PID" >/dev/null 2>&1 || true
-        sleep 1
+        warn "healthcheck threshold reached; restarting instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default}"
+        kill_ssh
         break
       fi
     fi
     sleep "$HC_INTERVAL"
   done
 
-  wait "$SSH_PID" >/dev/null 2>&1 || true
-  warn "ssh exited: instance=$INSTANCE; restart in 2s"
+  if (( SWITCH_SOURCE == 1 )); then
+    SWITCH_SOURCE=0
+    sleep 1
+    continue
+  fi
+
+  if [[ -n "${SSH_PID:-}" ]]; then
+    wait "$SSH_PID" >/dev/null 2>&1 || true
+    SSH_PID=""
+  fi
+  if (( ${#PUBLIC_IPS[@]} > 1 )); then
+    pick_source_ip "$CURRENT_SOURCE_IP"
+    warn "ssh exited: instance=$INSTANCE; try next source=${CURRENT_SOURCE_IP:-default} in 2s"
+  else
+    warn "ssh exited: instance=$INSTANCE; restart in 2s"
+  fi
   sleep 2
 done
 EOS
@@ -575,6 +783,8 @@ write_profile_env() {
   local ports_csv="$7" normal_ports_csv="$8" pinned_ports_csv="$9" pinning="${10}" ciphers="${11}" rekey="${12}" sa_int="${13}" sa_cnt="${14}"
   local known_hosts="${15}" ssh_alias="${16}" profile_enabled="${17}" hc_urls="${18}" hc_timeout="${19}" hc_retries="${20}"
   local hc_interval="${21}" hc_fails="${22}" heartbeat_every="${23}" debug_hc="${24}"
+  local source_ip_mode="${25:-auto}" source_ips="${26:-}" source_ip_refresh="${27:-60}"
+  local source_ip_connect_timeout="${28:-12}" source_ip_fails_to_switch="${29:-3}"
 
   local env_file
   env_file="$(profile_env_path "$profile")"
@@ -604,6 +814,11 @@ write_profile_env() {
     printf 'HC_FAILS_TO_RESTART=%q\n' "$hc_fails"
     printf 'HEARTBEAT_EVERY=%q\n' "$heartbeat_every"
     printf 'DEBUG_HEALTHCHECK=%q\n' "$debug_hc"
+    printf 'SOURCE_IP_MODE=%q\n' "$source_ip_mode"
+    printf 'SOURCE_IPS=%q\n' "$source_ips"
+    printf 'SOURCE_IP_REFRESH=%q\n' "$source_ip_refresh"
+    printf 'SOURCE_IP_CONNECT_TIMEOUT=%q\n' "$source_ip_connect_timeout"
+    printf 'SOURCE_IP_FAILS_TO_SWITCH=%q\n' "$source_ip_fails_to_switch"
   } >"$env_file"
 
   chmod 0644 "$env_file"
@@ -893,6 +1108,7 @@ show_profile_status() {
   echo "  Remote : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
   echo "  Ports  : ${PORT_SPEC}"
   echo "  Bind   : ${BIND_ADDR}"
+  echo "  Source : ${SOURCE_IP_MODE:-auto} outbound IP rotation (refresh ${SOURCE_IP_REFRESH:-60}s, switch after ${SOURCE_IP_FAILS_TO_SWITCH:-3} HC fails)"
 
   state_file="$(profile_state_path "$profile")"
   if [[ ! -r "$state_file" ]]; then
@@ -959,6 +1175,7 @@ create_or_update_profile_interactive() {
   local CIPHERS REKEY_LIMIT SA_INT SA_CNT KEY_PATH GEN_KEY INSTALL_KEY
   local KNOWN_HOSTS_FILE SSH_ALIAS PROFILE_ENABLED
   local HC_URLS HC_TIMEOUT HC_RETRIES HC_INTERVAL HC_FAILS HEARTBEAT_EVERY DEBUG_HC
+  local SOURCE_IP_MODE SOURCE_IPS SOURCE_IP_REFRESH SOURCE_IP_CONNECT_TIMEOUT SOURCE_IP_FAILS_TO_SWITCH
 
   if [[ "$exists" == "YES" ]]; then
     # shellcheck disable=SC1090
@@ -1092,13 +1309,21 @@ create_or_update_profile_interactive() {
   prompt_yesno "Generate key if missing?" "YES" GEN_KEY
   prompt_yesno "Install public key on remote using password?" "${INSTALL_KEY:-YES}" INSTALL_KEY
 
-  prompt_default "Health URLs (comma-separated)" "${HC_URLS:-http://clients3.google.com/generate_204,http://connectivitycheck.gstatic.com/generate_204,http://www.msftconnecttest.com/connecttest.txt}" HC_URLS
+  prompt_default "Health URLs (comma-separated)" "${HC_URLS:-$DEFAULT_HC_URLS}" HC_URLS
   prompt_default "Health timeout (sec)" "${HC_TIMEOUT:-5}" HC_TIMEOUT
   prompt_default "Health retries" "${HC_RETRIES:-2}" HC_RETRIES
   prompt_default "Health interval (sec)" "${HC_INTERVAL:-15}" HC_INTERVAL
   prompt_default "Fails before restart" "${HC_FAILS_TO_RESTART:-3}" HC_FAILS
   prompt_default "Heartbeat every N checks" "${HEARTBEAT_EVERY:-20}" HEARTBEAT_EVERY
   prompt_yesno "Enable detailed health debug logs?" "${DEBUG_HEALTHCHECK:-NO}" DEBUG_HC
+
+  echo "  Outbound IP: auto-detect public IPv4s and rotate per tunnel (BindAddress)."
+  echo "  Set SOURCE_IP_MODE=none in the env file to disable; SOURCE_IPS=1.2.3.4,5.6.7.8 for manual list."
+  SOURCE_IP_MODE="${SOURCE_IP_MODE:-auto}"
+  SOURCE_IPS="${SOURCE_IPS:-}"
+  SOURCE_IP_REFRESH="${SOURCE_IP_REFRESH:-60}"
+  SOURCE_IP_CONNECT_TIMEOUT="${SOURCE_IP_CONNECT_TIMEOUT:-12}"
+  SOURCE_IP_FAILS_TO_SWITCH="${SOURCE_IP_FAILS_TO_SWITCH:-3}"
 
   prompt_yesno "Enable this profile right after deploy?" "${PROFILE_ENABLED:-YES}" PROFILE_ENABLED
 
@@ -1151,7 +1376,8 @@ create_or_update_profile_interactive() {
 
   write_profile_env "$profile" "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_USER" "$KEY_PATH" "$BIND_ADDR" "$PORT_SPEC" \
     "$NORMAL_PORT_SPEC" "$PINNED_PORT_SPEC" "$PINNING" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
-    "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC"
+    "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC" \
+    "$SOURCE_IP_MODE" "$SOURCE_IPS" "$SOURCE_IP_REFRESH" "$SOURCE_IP_CONNECT_TIMEOUT" "$SOURCE_IP_FAILS_TO_SWITCH"
 
   deploy_profile "$profile"
 }
