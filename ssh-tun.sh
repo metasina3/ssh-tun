@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.4.0"
+VERSION="v9.4.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -236,16 +236,19 @@ _load_update_cache() {
 }
 
 # Check GitHub for a newer release. Returns 0 when check succeeded (even if up-to-date).
+# Pass "force" to bypass cache (used by self-update / check-update commands).
 # Never prints errors — callers decide what to show.
 check_for_update() {
-  local latest
+  local force="${1:-}" latest
   UPDATE_CHECK_OK="NO"
   UPDATE_AVAILABLE="NO"
   UPDATE_LATEST_VERSION=""
 
-  if _load_update_cache; then
-    [[ "${UPDATE_CHECK_OK:-NO}" == "YES" ]]
-    return $?
+  if [[ "$force" != "force" && "$force" != "--force" ]]; then
+    if _load_update_cache; then
+      [[ "${UPDATE_CHECK_OK:-NO}" == "YES" ]]
+      return $?
+    fi
   fi
 
   latest="$(_fetch_latest_version_remote)" || {
@@ -279,7 +282,7 @@ cmd_check_update() {
   need_root
   ensure_dirs
   section "Program update check"
-  if ! check_for_update; then
+  if ! check_for_update force; then
     log "Could not reach GitHub (optional check). Current version: ${VERSION}"
     log "You can continue using the program normally."
     return 0
@@ -288,7 +291,7 @@ cmd_check_update() {
     ok "New version available: ${UPDATE_LATEST_VERSION} (installed: ${VERSION})"
     log "Run: ssh-tun self-update   or choose menu option 13"
   else
-    ok "You are on the latest known version (${VERSION})."
+    ok "You are on the latest known release (${VERSION})."
   fi
 }
 
@@ -307,18 +310,10 @@ cmd_self_update() {
 
   section "Update program from GitHub"
 
-  if ! check_for_update; then
-    warn "Could not reach GitHub. Update skipped; current version ${VERSION} is unchanged."
-    log "This is optional — the program continues to work normally."
-    return 0
-  fi
+  # Always bypass cache for an explicit update attempt.
+  check_for_update force >/dev/null 2>&1 || true
 
-  if [[ "$UPDATE_AVAILABLE" != "YES" ]]; then
-    ok "Already up to date (${VERSION})."
-    return 0
-  fi
-
-  log "Downloading latest script from GitHub (${UPDATE_LATEST_VERSION})..."
+  log "Downloading latest script from GitHub..."
   tmp="$(mktemp)"
   dl_ok="NO"
   if curl -fsSL --connect-timeout 10 --max-time 90 "$GITHUB_RAW_URL" -o "$tmp" 2>/dev/null; then
@@ -336,6 +331,18 @@ cmd_self_update() {
     rm -f "$tmp"
     return 0
   fi
+
+  if ! version_newer_than "$new_ver" "$VERSION"; then
+    ok "Already up to date (${VERSION})."
+    UPDATE_CHECK_OK="YES"
+    UPDATE_AVAILABLE="NO"
+    UPDATE_LATEST_VERSION="$new_ver"
+    _save_update_cache
+    rm -f "$tmp"
+    return 0
+  fi
+
+  log "Update available: ${VERSION} -> ${new_ver}"
 
   if [[ "$auto_yes" != "YES" ]]; then
     prompt_yesno "Install update ${VERSION} -> ${new_ver}?" "YES" ask
