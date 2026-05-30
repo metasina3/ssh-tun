@@ -159,7 +159,7 @@ When you `create` or `update` a profile, the tool will ask for:
 | Prompt | Meaning |
 | --- | --- |
 | Remote host/IP, port, user | The SSH server abroad |
-| Local bind address | Usually `127.0.0.1` (use `0.0.0.0` to expose on the LAN — be careful) |
+| Local bind address | Usually `127.0.0.1` — **listens on both `127.0.0.1` and `::1`** by default (IPv6 added only when available). Use `0.0.0.0` for all v4+v6, or a specific IP/IPv6 literal |
 | Normal SOCKS ports | Ports that run as plain tunnels |
 | Pinned-per-core SOCKS ports | Ports pinned to CPU cores via `taskset` |
 | SSH cipher | `chacha20-poly1305` (default) or AES-GCM/CTR variants |
@@ -230,6 +230,13 @@ export ALL_PROXY=socks5h://127.0.0.1:1660
 ```
 
 Use `socks5h://` (note the `h`) so DNS is resolved on the remote side.
+
+By default the loopback proxy is reachable over both IPv4 and IPv6:
+
+```bash
+curl --proxy socks5h://127.0.0.1:1660 https://ifconfig.me   # IPv4 loopback
+curl --proxy socks5h://[::1]:1660      https://ifconfig.me   # IPv6 loopback
+```
 
 ## File layout
 

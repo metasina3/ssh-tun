@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.0.0"
+VERSION="v9.1.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -266,11 +266,62 @@ HC_FAILS_TO_RESTART="${HC_FAILS_TO_RESTART:-3}"
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-20}"
 DEBUG_HEALTHCHECK="${DEBUG_HEALTHCHECK:-NO}"
 
+ipv6_stack_available() { [[ -e /proc/net/if_inet6 ]]; }
+
+ipv6_loopback_available() {
+  [[ -e /proc/net/if_inet6 ]] || return 1
+  if command -v ip >/dev/null 2>&1; then
+    if ip -6 addr show dev lo 2>/dev/null | grep -q 'inet6 ::1/'; then
+      return 0
+    fi
+    return 1
+  fi
+  local d=/proc/sys/net/ipv6/conf/lo/disable_ipv6
+  [[ -r "$d" ]] || return 1
+  [[ "$(cat "$d" 2>/dev/null)" == "0" ]]
+}
+
+# Build the list of -D (dynamic SOCKS) bind specs and the address used by the
+# health check. Loopback ("127.0.0.1"/"localhost"/"loopback"/"both"/empty)
+# listens on BOTH IPv4 127.0.0.1 and IPv6 ::1 by default. ::1 is only added
+# when IPv6 loopback is actually available, otherwise ExitOnForwardFailure=yes
+# would tear the tunnel down on IPv6-disabled hosts.
+DYNF=()
+PROBE_HOST="127.0.0.1"
+case "$BIND_ADDR" in
+  127.0.0.1|localhost|loopback|both|dual|"")
+    DYNF+=(-D "127.0.0.1:${SOCKS_PORT}")
+    if ipv6_loopback_available; then DYNF+=(-D "[::1]:${SOCKS_PORT}"); fi
+    PROBE_HOST="127.0.0.1"
+    ;;
+  0.0.0.0|any|all|"*")
+    DYNF+=(-D "0.0.0.0:${SOCKS_PORT}")
+    if ipv6_stack_available; then DYNF+=(-D "[::]:${SOCKS_PORT}"); fi
+    PROBE_HOST="127.0.0.1"
+    ;;
+  ::1)
+    DYNF+=(-D "[::1]:${SOCKS_PORT}")
+    PROBE_HOST="[::1]"
+    ;;
+  ::)
+    DYNF+=(-D "[::]:${SOCKS_PORT}")
+    PROBE_HOST="[::1]"
+    ;;
+  *:*)
+    DYNF+=(-D "[${BIND_ADDR}]:${SOCKS_PORT}")
+    PROBE_HOST="[${BIND_ADDR}]"
+    ;;
+  *)
+    DYNF+=(-D "${BIND_ADDR}:${SOCKS_PORT}")
+    PROBE_HOST="${BIND_ADDR}"
+    ;;
+esac
+
 SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 SSH_OPTS=(
   -F /dev/null
   -N
-  -D "${BIND_ADDR}:${SOCKS_PORT}"
+  "${DYNF[@]}"
   -p "${REMOTE_PORT}"
   -i "${KEY_PATH}"
   -o "IdentitiesOnly=yes"
@@ -298,7 +349,7 @@ probe_socks_http() {
     code="$(curl -s -o /dev/null -w '%{http_code}' \
       --connect-timeout "$HC_TIMEOUT" --max-time "$HC_TIMEOUT" \
       --retry "$HC_RETRIES" --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
-      --proxy "socks5h://${BIND_ADDR}:${SOCKS_PORT}" \
+      --proxy "socks5h://${PROBE_HOST}:${SOCKS_PORT}" \
       "$endpoint" 2>/dev/null || true)"
 
     if [[ "$code" == "204" || "$code" == "200" ]]; then
@@ -921,6 +972,8 @@ create_or_update_profile_interactive() {
   prompt_default "Remote host/IP" "${REMOTE_HOST:-}" REMOTE_HOST
   prompt_default "Remote SSH port" "${REMOTE_PORT:-22}" REMOTE_PORT
   prompt_default "Remote SSH user" "${REMOTE_USER:-root}" REMOTE_USER
+  # 127.0.0.1 (default) binds BOTH 127.0.0.1 and ::1 when IPv6 is available.
+  echo "  (loopback default listens on both 127.0.0.1 and ::1; use 0.0.0.0 for all v4+v6, or a specific IP)"
   prompt_default "Local bind address" "${BIND_ADDR:-127.0.0.1}" BIND_ADDR
 
   local default_normal_ports="${NORMAL_PORT_SPEC:-4040}"
