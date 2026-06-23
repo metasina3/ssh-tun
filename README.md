@@ -43,6 +43,7 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Max-bandwidth optimization** – one command applies BBR + `fq`, large TCP buffers, and high file-descriptor limits on **both** the local host and the remote server (with `sshd -t` validation before reload).
 - **Multi-public-IP rotation** – when the local host has several public IPv4 addresses, each tunnel automatically picks one (`ssh BindAddress`), rotates on connect/health failures, and refreshes the IP pool when addresses are added or removed.
 - **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
+- **Reverse dynamic SOCKS** – optional profile type that opens a single SOCKS5 proxy on the **remote** server via `ssh -R` (bind internal `127.0.0.1`+`::1` by default, or all interfaces `0.0.0.0`+`::`); health checks run on the remote via `curl` through the proxy.
 - **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 13); failures are non-fatal if GitHub is unreachable.
 - **Full server uninstall** – remove all profiles, units, and installed files from the host (`uninstall`, menu option 14); optional retention of tuning files and cleanup of SSH config entries.
 - **Single file, no dependencies to build** – just a Bash script.
@@ -156,8 +157,10 @@ ssh-tun                          # interactive menu
 ssh-tun install                  # install command to /usr/local/bin/ssh-tun
 ssh-tun doctor                   # check/install prereqs + refresh runtime assets
 ssh-tun list                     # list profiles
-ssh-tun create <profile>         # create profile and deploy
-ssh-tun update <profile>         # update profile and redeploy
+ssh-tun create <profile>         # create forward profile (local SOCKS) and deploy
+ssh-tun create-reverse <profile> # create reverse profile (remote SOCKS via -R) and deploy
+ssh-tun update <profile>         # update forward profile and redeploy
+ssh-tun update-reverse <profile> # update reverse profile and redeploy
 ssh-tun enable <profile>         # enable/start profile
 ssh-tun disable <profile>        # disable/stop profile
 ssh-tun delete <profile>         # remove profile and units
@@ -172,9 +175,11 @@ ssh-tun uninstall [--yes] [--keep-tuning] [--clean-ssh-config]  # remove tool fr
 
 ## Profiles
 
-A profile describes one remote server and the set of local SOCKS5 ports to open against it. Profiles are stored as `*.env` files under `/etc/ssh-tun/profiles/`.
+A profile describes one remote server and either **local** SOCKS5 ports (forward, `ssh -D`) or a **single remote** SOCKS5 port (reverse, `ssh -R`). Profiles are stored as `*.env` files under `/etc/ssh-tun/profiles/`.
 
-When you `create` or `update` a profile, the tool will ask for:
+### Forward profiles (default)
+
+When you `create` or `update` a forward profile, the tool will ask for:
 
 | Prompt | Meaning |
 | --- | --- |
@@ -185,6 +190,23 @@ When you `create` or `update` a profile, the tool will ask for:
 | SSH cipher | `chacha20-poly1305` (default) or AES-GCM/CTR variants |
 | Key path / generate / install | Auto-generates `ed25519` and installs it on the remote using a one-time password login |
 | Health-check settings | URLs, timeout, retries, interval, fails-before-restart, heartbeat |
+
+### Reverse profiles (`create-reverse`)
+
+Reverse profiles open **one SOCKS5 proxy on the remote server** (not locally). Use when apps on the remote host (or clients that can reach it) need outbound access tunneled through your local machine's network path.
+
+```bash
+ssh-tun create-reverse myrev
+```
+
+| Prompt | Meaning |
+| --- | --- |
+| Remote host/IP, port, user | The SSH server where SOCKS will listen |
+| Remote bind mode | **internal** (default): `127.0.0.1` + `::1` on remote — localhost only. **public**: `0.0.0.0` + `::` — all interfaces (auto-configures `GatewayPorts clientspecified` on remote sshd) |
+| Remote SOCKS port | Single TCP port on the destination server |
+| Health-check settings | Probes run **on the remote** via `ssh` + `curl --proxy socks5h://…` |
+
+Health check: the supervisor SSHes to the remote and runs `curl` through the remote SOCKS proxy (same `generate_204` URLs as forward profiles). If the port is down or the proxy cannot reach the internet, the tunnel is restarted.
 
 > Profile names may use `A–Z a–z 0–9 . _ -`, must not contain `__`, and must not start with `.` or `-`.
 

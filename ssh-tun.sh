@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.4.1"
+VERSION="v9.5.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -157,6 +157,29 @@ profile_get() {
     source "$env_file" >/dev/null 2>&1 || true
     printf '%s' "${!var:-}"
   )
+}
+
+profile_type_of() {
+  local env_file="$1"
+  local t
+  t="$(profile_get "$env_file" PROFILE_TYPE)"
+  [[ -n "$t" ]] && printf '%s' "$t" || printf 'forward'
+}
+
+is_reverse_profile_file() {
+  [[ "$(profile_type_of "$1")" == "reverse" ]]
+}
+
+remote_bind_needs_gateway_ports() {
+  local bind="$1"
+  case "$bind" in
+    127.0.0.1|localhost|loopback|both|dual|internal|::1|"")
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 ensure_dirs() {
@@ -461,6 +484,9 @@ ENV_FILE="${PROFILES_DIR}/${PROFILE_ID}.env"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+PROFILE_TYPE="${PROFILE_TYPE:-forward}"
+REMOTE_BIND_ADDR="${REMOTE_BIND_ADDR:-${BIND_ADDR:-127.0.0.1}}"
+
 CORE=""
 SOCKS_PORT="$INSTANCE"
 if [[ "$INSTANCE" == *"-"* ]]; then
@@ -496,6 +522,8 @@ CURRENT_SOURCE_IP=""
 LAST_IP_REFRESH=0
 SSH_OPTS=()
 DYNF=()
+REVF=()
+HC_SSH_OPTS=()
 PROBE_HOST="127.0.0.1"
 SWITCH_SOURCE=0
 
@@ -584,6 +612,39 @@ pick_source_ip() {
   CURRENT_SOURCE_IP="${pool[$idx]}"
 }
 
+build_reverse_forwards() {
+  REVF=()
+  PROBE_HOST="127.0.0.1"
+  case "$REMOTE_BIND_ADDR" in
+    127.0.0.1|localhost|loopback|both|dual|internal|"")
+      REVF+=(-R "127.0.0.1:${SOCKS_PORT}")
+      if ipv6_loopback_available; then REVF+=(-R "[::1]:${SOCKS_PORT}"); fi
+      PROBE_HOST="127.0.0.1"
+      ;;
+    0.0.0.0|any|all|"*"|public)
+      REVF+=(-R "0.0.0.0:${SOCKS_PORT}")
+      if ipv6_stack_available; then REVF+=(-R "[::]:${SOCKS_PORT}"); fi
+      PROBE_HOST="127.0.0.1"
+      ;;
+    ::1)
+      REVF+=(-R "[::1]:${SOCKS_PORT}")
+      PROBE_HOST="[::1]"
+      ;;
+    ::)
+      REVF+=(-R "[::]:${SOCKS_PORT}")
+      PROBE_HOST="[::1]"
+      ;;
+    *:*)
+      REVF+=(-R "[${REMOTE_BIND_ADDR}]:${SOCKS_PORT}")
+      PROBE_HOST="[${REMOTE_BIND_ADDR}]"
+      ;;
+    *)
+      REVF+=(-R "${REMOTE_BIND_ADDR}:${SOCKS_PORT}")
+      PROBE_HOST="${REMOTE_BIND_ADDR}"
+      ;;
+  esac
+}
+
 build_dyn_forwards() {
   DYNF=()
   PROBE_HOST="127.0.0.1"
@@ -617,7 +678,61 @@ build_dyn_forwards() {
   esac
 }
 
+build_hc_ssh_opts() {
+  HC_SSH_OPTS=(
+    -F /dev/null
+    -p "${REMOTE_PORT}"
+    -i "${KEY_PATH}"
+    -o "IdentitiesOnly=yes"
+    -o "Compression=no"
+    -o "Ciphers=${CIPHERS}"
+    -o "ServerAliveInterval=${SERVER_ALIVE_INTERVAL}"
+    -o "ServerAliveCountMax=${SERVER_ALIVE_COUNTMAX}"
+    -o "TCPKeepAlive=yes"
+    -o "GSSAPIAuthentication=no"
+    -o "StrictHostKeyChecking=accept-new"
+    -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
+    -o "ConnectTimeout=${SOURCE_IP_CONNECT_TIMEOUT}"
+    -o "BatchMode=yes"
+    -o "LogLevel=ERROR"
+  )
+  if [[ -n "$CURRENT_SOURCE_IP" ]]; then
+    HC_SSH_OPTS+=(-o "BindAddress=${CURRENT_SOURCE_IP}")
+  fi
+}
+
 build_ssh_opts() {
+  if [[ "$PROFILE_TYPE" == "reverse" ]]; then
+    build_reverse_forwards
+    build_hc_ssh_opts
+    SSH_OPTS=(
+      -F /dev/null
+      -N
+      "${REVF[@]}"
+      -p "${REMOTE_PORT}"
+      -i "${KEY_PATH}"
+      -o "IdentitiesOnly=yes"
+      -o "Compression=no"
+      -o "IPQoS=throughput"
+      -o "Ciphers=${CIPHERS}"
+      -o "RekeyLimit=${REKEY_LIMIT}"
+      -o "ExitOnForwardFailure=yes"
+      -o "ServerAliveInterval=${SERVER_ALIVE_INTERVAL}"
+      -o "ServerAliveCountMax=${SERVER_ALIVE_COUNTMAX}"
+      -o "TCPKeepAlive=yes"
+      -o "GSSAPIAuthentication=no"
+      -o "StrictHostKeyChecking=accept-new"
+      -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
+      -o "ConnectTimeout=${SOURCE_IP_CONNECT_TIMEOUT}"
+      -o "BatchMode=yes"
+      -o "LogLevel=ERROR"
+    )
+    if [[ -n "$CURRENT_SOURCE_IP" ]]; then
+      SSH_OPTS+=(-o "BindAddress=${CURRENT_SOURCE_IP}")
+    fi
+    return 0
+  fi
+
   build_dyn_forwards
   SSH_OPTS=(
     -F /dev/null
@@ -647,6 +762,11 @@ build_ssh_opts() {
 }
 
 socks_port_listening() {
+  if [[ "$PROFILE_TYPE" == "reverse" ]]; then
+    ssh "${HC_SSH_OPTS[@]}" "$SSH_TARGET" \
+      "ss -lntH 'sport = :${SOCKS_PORT}' 2>/dev/null | grep -q ." 2>/dev/null
+    return $?
+  fi
   ss -lntH "sport = :${SOCKS_PORT}" 2>/dev/null | grep -q .
 }
 
@@ -655,17 +775,28 @@ probe_socks_http() {
   IFS=',' read -r -a endpoints <<< "$HC_URLS"
   for endpoint in "${endpoints[@]}"; do
     [[ -n "$endpoint" ]] || continue
-    code="$(curl -s -o /dev/null -w '%{http_code}' \
-      --connect-timeout "$HC_TIMEOUT" --max-time "$HC_TIMEOUT" \
-      --retry "$HC_RETRIES" --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
-      --proxy "socks5h://${PROBE_HOST}:${SOCKS_PORT}" \
-      "$endpoint" 2>/dev/null || true)"
+    if [[ "$PROFILE_TYPE" == "reverse" ]]; then
+      code="$(ssh "${HC_SSH_OPTS[@]}" "$SSH_TARGET" \
+        "curl -s -o /dev/null -w '%{http_code}' \
+          --connect-timeout ${HC_TIMEOUT} --max-time ${HC_TIMEOUT} \
+          --retry ${HC_RETRIES} --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
+          --proxy 'socks5h://${PROBE_HOST}:${SOCKS_PORT}' \
+          '${endpoint}'" 2>/dev/null || true)"
+    else
+      code="$(curl -s -o /dev/null -w '%{http_code}' \
+        --connect-timeout "$HC_TIMEOUT" --max-time "$HC_TIMEOUT" \
+        --retry "$HC_RETRIES" --retry-delay 0 --retry-max-time $((HC_TIMEOUT*HC_RETRIES)) \
+        --proxy "socks5h://${PROBE_HOST}:${SOCKS_PORT}" \
+        "$endpoint" 2>/dev/null || true)"
+    fi
 
     if [[ "$code" == "204" || "$code" == "200" ]]; then
       return 0
     fi
     if [[ "$DEBUG_HEALTHCHECK" == "YES" ]]; then
-      warn "HC endpoint failed: port=$SOCKS_PORT source=${CURRENT_SOURCE_IP:-default} endpoint=$endpoint code=${code:-n/a}"
+      local where="local"
+      [[ "$PROFILE_TYPE" == "reverse" ]] && where="remote"
+      warn "HC endpoint failed (${where}): port=$SOCKS_PORT source=${CURRENT_SOURCE_IP:-default} endpoint=$endpoint code=${code:-n/a}"
     fi
   done
   return 1
@@ -999,11 +1130,13 @@ write_profile_env() {
   local hc_interval="${21}" hc_fails="${22}" heartbeat_every="${23}" debug_hc="${24}"
   local source_ip_mode="${25:-auto}" source_ips="${26:-}" source_ip_refresh="${27:-60}"
   local source_ip_connect_timeout="${28:-12}" source_ip_fails_to_switch="${29:-3}"
+  local profile_type="${30:-forward}" remote_socks_port="${31:-}" remote_bind_addr="${32:-}"
 
   local env_file
   env_file="$(profile_env_path "$profile")"
 
   {
+    printf 'PROFILE_TYPE=%q\n' "$profile_type"
     printf 'PROFILE_NAME=%q\n' "$profile"
     printf 'PROFILE_ENABLED=%q\n' "$profile_enabled"
     printf 'REMOTE_HOST=%q\n' "$remote_host"
@@ -1011,6 +1144,8 @@ write_profile_env() {
     printf 'REMOTE_USER=%q\n' "$remote_user"
     printf 'KEY_PATH=%q\n' "$key_path"
     printf 'BIND_ADDR=%q\n' "$bind_addr"
+    printf 'REMOTE_BIND_ADDR=%q\n' "${remote_bind_addr:-$bind_addr}"
+    printf 'REMOTE_SOCKS_PORT=%q\n' "$remote_socks_port"
     printf 'PORT_SPEC=%q\n' "$ports_csv"
     printf 'NORMAL_PORT_SPEC=%q\n' "$normal_ports_csv"
     printf 'PINNED_PORT_SPEC=%q\n' "$pinned_ports_csv"
@@ -1049,14 +1184,17 @@ load_profile() {
 list_profiles() {
   section "Profiles"
   local found=0 env_file profile enabled state_file unit_count active_count unit
-  local port_spec remote_user remote_host remote_port
+  local port_spec remote_user remote_host remote_port profile_type remote_bind
   local idx=0
   shopt -s nullglob
   for env_file in "$PROFILES_DIR"/*.env; do
     found=1
     idx=$((idx + 1))
     profile="$(basename "$env_file" .env)"
+    profile_type="$(profile_type_of "$env_file")"
     port_spec="$(profile_get "$env_file" PORT_SPEC)"
+    remote_bind="$(profile_get "$env_file" REMOTE_BIND_ADDR)"
+    [[ -n "$remote_bind" ]] || remote_bind="$(profile_get "$env_file" BIND_ADDR)"
     enabled="$(profile_get "$env_file" PROFILE_ENABLED)"; enabled="${enabled:-YES}"
     remote_user="$(profile_get "$env_file" REMOTE_USER)"
     remote_host="$(profile_get "$env_file" REMOTE_HOST)"
@@ -1073,8 +1211,13 @@ list_profiles() {
         fi
       done <"$state_file"
     fi
-    printf "  %d) %s (%s) | enabled=%s | active=%s/%s | %s@%s:%s\n" \
-      "$idx" "$profile" "$port_spec" "$enabled" "$active_count" "$unit_count" "$remote_user" "$remote_host" "$remote_port"
+    if [[ "$profile_type" == "reverse" ]]; then
+      printf "  %d) %s [reverse] remote-port=%s bind=%s | enabled=%s | active=%s/%s | %s@%s:%s\n" \
+        "$idx" "$profile" "$port_spec" "$remote_bind" "$enabled" "$active_count" "$unit_count" "$remote_user" "$remote_host" "$remote_port"
+    else
+      printf "  %d) %s [forward] ports=%s | enabled=%s | active=%s/%s | %s@%s:%s\n" \
+        "$idx" "$profile" "$port_spec" "$enabled" "$active_count" "$unit_count" "$remote_user" "$remote_host" "$remote_port"
+    fi
   done
   shopt -u nullglob
   (( found == 1 )) || echo "  (no profiles yet)"
@@ -1126,6 +1269,17 @@ build_instances_for_profile() {
 
   local -a normal_ports=() pinned_ports=() legacy_ports=() instances=() unit_instances=()
   local p idx=0 cores core short
+
+  if [[ "${PROFILE_TYPE:-forward}" == "reverse" ]]; then
+    p="${REMOTE_SOCKS_PORT:-}"
+    [[ -n "$p" ]] || die "Reverse profile missing REMOTE_SOCKS_PORT: $profile"
+    is_port "$p" || die "Invalid remote SOCKS port in profile: $profile"
+    instances+=("$p")
+    unit_instances+=("ssh-tun@${profile}__${p}.service")
+    printf '%s\n' "${instances[@]}" >"$TMP_INSTANCES"
+    printf '%s\n' "${unit_instances[@]}" >"$TMP_UNIT_INSTANCES"
+    return 0
+  fi
 
   # Backward compatibility:
   # Old profiles may only have PORT_SPEC + PINNING.
@@ -1239,6 +1393,10 @@ deploy_profile() {
   systemd_reload
   reconcile_instances "$profile"
 
+  if [[ "${PROFILE_TYPE:-forward}" == "reverse" ]]; then
+    ensure_remote_reverse_sshd "$profile" || true
+  fi
+
   local farm_service="ssh-tun-farm-${profile}.service"
   if [[ "${PROFILE_ENABLED:-YES}" == "YES" ]]; then
     systemctl enable --now "$farm_service" >/dev/null 2>&1 || true
@@ -1268,15 +1426,22 @@ set_profile_enabled() {
 
 remove_profile() {
   local profile="$1"
-  local env_file state_file farm_service unit bind_addr
+  local env_file state_file farm_service unit bind_addr profile_type remote_port
   local -a ports=()
   env_file="$(profile_env_path "$profile")"
   state_file="$(profile_state_path "$profile")"
   [[ -r "$env_file" ]] || die "Profile not found: $profile"
   # shellcheck disable=SC1090
   source "$env_file"
+  profile_type="${PROFILE_TYPE:-forward}"
   bind_addr="${BIND_ADDR:-127.0.0.1}"
-  mapfile -t ports < <(parse_ports_spec "${PORT_SPEC:-}" || true)
+  if [[ "$profile_type" == "reverse" ]]; then
+    remote_port="${REMOTE_SOCKS_PORT:-${PORT_SPEC:-}}"
+    [[ -n "$remote_port" ]] && ports=("$remote_port")
+    bind_addr="${REMOTE_BIND_ADDR:-$bind_addr}"
+  else
+    mapfile -t ports < <(parse_ports_spec "${PORT_SPEC:-}" || true)
+  fi
 
   if [[ -r "$state_file" ]]; then
     while IFS= read -r unit; do
@@ -1296,7 +1461,7 @@ remove_profile() {
       comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
       [[ "$comm" == "ssh" ]] || continue
       kill "$pid" >/dev/null 2>&1 || true
-    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || true)
+    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || pgrep -f -- "-R.*:${p}" || true)
   done
   sleep 1
   for p in "${ports[@]}"; do
@@ -1305,7 +1470,7 @@ remove_profile() {
       comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
       [[ "$comm" == "ssh" ]] || continue
       kill -9 "$pid" >/dev/null 2>&1 || true
-    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || true)
+    done < <(pgrep -f -- "-D ${bind_addr}:${p}" || pgrep -f -- "-R.*:${p}" || true)
   done
 
   rm -f "$env_file" "$state_file" "/etc/systemd/system/${farm_service}" "/etc/systemd/system/${farm_service}.d/wants.conf"
@@ -1318,11 +1483,18 @@ show_profile_status() {
   local profile="$1" state_file unit
   load_profile "$profile"
   echo "Profile: $profile"
+  echo "  Type   : ${PROFILE_TYPE:-forward}"
   echo "  Enabled: ${PROFILE_ENABLED:-YES}"
   echo "  Remote : ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
-  echo "  Ports  : ${PORT_SPEC}"
-  echo "  Bind   : ${BIND_ADDR}"
-  echo "  Source : ${SOURCE_IP_MODE:-auto} outbound IP rotation (refresh ${SOURCE_IP_REFRESH:-60}s, switch after ${SOURCE_IP_FAILS_TO_SWITCH:-3} HC fails)"
+  if [[ "${PROFILE_TYPE:-forward}" == "reverse" ]]; then
+    echo "  Remote SOCKS port: ${REMOTE_SOCKS_PORT:-${PORT_SPEC}}"
+    echo "  Remote bind      : ${REMOTE_BIND_ADDR:-${BIND_ADDR}}"
+    echo "  Health           : remote curl via SOCKS on destination server"
+  else
+    echo "  Ports  : ${PORT_SPEC}"
+    echo "  Bind   : ${BIND_ADDR}"
+    echo "  Source : ${SOURCE_IP_MODE:-auto} outbound IP rotation (refresh ${SOURCE_IP_REFRESH:-60}s, switch after ${SOURCE_IP_FAILS_TO_SWITCH:-3} HC fails)"
+  fi
 
   state_file="$(profile_state_path "$profile")"
   if [[ ! -r "$state_file" ]]; then
@@ -1378,11 +1550,17 @@ create_or_update_profile_interactive() {
   [[ -r "$env_file" ]] && exists="YES"
 
   if [[ "$mode" == "create" && "$exists" == "YES" ]]; then
+    if [[ "$(profile_type_of "$env_file")" == "reverse" ]]; then
+      die "Profile exists as reverse type. Use: ssh-tun create-reverse $profile (or another name)."
+    fi
     prompt_yesno "Profile exists. Overwrite and redeploy?" "NO" overwrite
     [[ "$overwrite" == "YES" ]] || die "Cancelled."
   fi
   if [[ "$mode" == "update" && "$exists" == "NO" ]]; then
     die "Profile not found: $profile"
+  fi
+  if [[ "$mode" == "update" && "$exists" == "YES" && "$(profile_type_of "$env_file")" == "reverse" ]]; then
+    die "Profile '$profile' is a reverse profile. Use: ssh-tun update-reverse $profile"
   fi
 
   local REMOTE_HOST REMOTE_PORT REMOTE_USER BIND_ADDR PORT_SPEC NORMAL_PORT_SPEC PINNED_PORT_SPEC PINNING OLD_PORT_SPEC OLD_NORMAL_PORT_SPEC OLD_PINNED_PORT_SPEC
@@ -1591,7 +1769,261 @@ create_or_update_profile_interactive() {
   write_profile_env "$profile" "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_USER" "$KEY_PATH" "$BIND_ADDR" "$PORT_SPEC" \
     "$NORMAL_PORT_SPEC" "$PINNED_PORT_SPEC" "$PINNING" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
     "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC" \
-    "$SOURCE_IP_MODE" "$SOURCE_IPS" "$SOURCE_IP_REFRESH" "$SOURCE_IP_CONNECT_TIMEOUT" "$SOURCE_IP_FAILS_TO_SWITCH"
+    "$SOURCE_IP_MODE" "$SOURCE_IPS" "$SOURCE_IP_REFRESH" "$SOURCE_IP_CONNECT_TIMEOUT" "$SOURCE_IP_FAILS_TO_SWITCH" \
+    "forward" "" ""
+
+  deploy_profile "$profile"
+}
+
+prompt_remote_bind_mode() {
+  local __var="$1" current="${2:-127.0.0.1}"
+  local ans
+  echo "Remote SOCKS bind mode on destination server:"
+  echo "  1) internal — 127.0.0.1 + ::1 (default, localhost only on remote)"
+  echo "  2) public    — 0.0.0.0 + :: (all interfaces; requires GatewayPorts on remote sshd)"
+  while true; do
+    read -r -p "Choose bind mode [1]: " ans || true
+    ans="${ans:-1}"
+    case "$ans" in
+      1|internal|127.0.0.1|loopback)
+        printf -v "$__var" "127.0.0.1"
+        return 0
+        ;;
+      2|public|0.0.0.0|all|"*")
+        printf -v "$__var" "0.0.0.0"
+        return 0
+        ;;
+      *)
+        if [[ -n "$ans" ]]; then
+          printf -v "$__var" "%s" "$ans"
+          return 0
+        fi
+        warn "Invalid choice."
+        ;;
+    esac
+  done
+}
+
+remote_port_in_use() {
+  local user="$1" host="$2" port="$3" key_path="$4" known_hosts="$5" socks_port="$6"
+  local -a key_opts out
+  mapfile -t key_opts < <(ssh_key_opts "$known_hosts")
+  out="$(ssh -F /dev/null -T -p "$port" -i "$key_path" -o BatchMode=yes "${key_opts[@]}" "${user}@${host}" \
+    "ss -lntH 'sport = :${socks_port}' 2>/dev/null" 2>/dev/null || true)"
+  [[ -n "$out" ]]
+}
+
+ensure_remote_reverse_sshd() {
+  local profile="$1"
+  load_profile "$profile"
+  local bind="${REMOTE_BIND_ADDR:-${BIND_ADDR:-127.0.0.1}}"
+  remote_bind_needs_gateway_ports "$bind" || return 0
+
+  section "Remote sshd: GatewayPorts for public reverse SOCKS ($profile)"
+  if ! remote_admin_ssh "$profile" "true"; then
+    warn "Cannot reach remote for GatewayPorts setup."
+    return 1
+  fi
+
+  local remote_dropin="/etc/ssh/sshd_config.d/99-ssh-tun-reverse.conf"
+  local remote_script SUDO=""
+  if [[ "$REMOTE_USER" != "root" ]]; then
+    if remote_admin_ssh "$profile" "command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null"; then
+      SUDO="sudo "
+    else
+      warn "Remote user is not root and passwordless sudo unavailable; public bind may fail until GatewayPorts is enabled."
+      return 1
+    fi
+  fi
+
+  remote_script="$(cat <<EOF
+set -e
+${SUDO}mkdir -p /etc/ssh/sshd_config.d
+cat <<'SSHD' | ${SUDO}tee ${remote_dropin} >/dev/null
+# Managed by ssh-tun (reverse SOCKS with public bind).
+GatewayPorts clientspecified
+AllowTcpForwarding yes
+SSHD
+if ${SUDO}sshd -t 2>/tmp/ssh-tun-reverse-sshd-test; then
+  if command -v systemctl >/dev/null 2>&1; then
+    for s in ssh sshd; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^\${s}.service"; then
+        ${SUDO}systemctl reload "\$s" 2>/dev/null || ${SUDO}systemctl restart "\$s" 2>/dev/null || true
+        echo "REVERSE_SSHD_OK svc=\$s"
+        exit 0
+      fi
+    done
+  fi
+  ${SUDO}service ssh reload 2>/dev/null || ${SUDO}service sshd reload 2>/dev/null || true
+  echo "REVERSE_SSHD_OK svc=service"
+else
+  ${SUDO}rm -f ${remote_dropin}
+  cat /tmp/ssh-tun-reverse-sshd-test
+  exit 1
+fi
+EOF
+)"
+  if remote_admin_ssh "$profile" "$remote_script"; then
+    ok "Remote sshd configured for public reverse SOCKS (GatewayPorts clientspecified)."
+  else
+    warn "Failed to configure remote GatewayPorts; public bind may not work."
+    return 1
+  fi
+}
+
+create_or_update_reverse_profile_interactive() {
+  local mode="$1" profile="$2"
+  local env_file exists overwrite
+  validate_profile_name "$profile"
+  ensure_dirs
+
+  env_file="$(profile_env_path "$profile")"
+  exists="NO"
+  [[ -r "$env_file" ]] && exists="YES"
+
+  if [[ "$mode" == "create" && "$exists" == "YES" ]]; then
+    if [[ "$(profile_type_of "$env_file")" != "reverse" ]]; then
+      die "Profile exists with a different type (forward). Choose another name or delete it first."
+    fi
+    prompt_yesno "Reverse profile exists. Overwrite and redeploy?" "NO" overwrite
+    [[ "$overwrite" == "YES" ]] || die "Cancelled."
+  fi
+  if [[ "$mode" == "update" && "$exists" == "NO" ]]; then
+    die "Reverse profile not found: $profile"
+  fi
+  if [[ "$mode" == "update" && "$exists" == "YES" && "$(profile_type_of "$env_file")" != "reverse" ]]; then
+    die "Profile '$profile' is a forward profile. Use: ssh-tun update $profile"
+  fi
+
+  local REMOTE_HOST REMOTE_PORT REMOTE_USER REMOTE_BIND_ADDR REMOTE_SOCKS_PORT
+  local CIPHERS REKEY_LIMIT SA_INT SA_CNT KEY_PATH GEN_KEY INSTALL_KEY
+  local KNOWN_HOSTS_FILE SSH_ALIAS PROFILE_ENABLED
+  local HC_URLS HC_TIMEOUT HC_RETRIES HC_INTERVAL HC_FAILS HEARTBEAT_EVERY DEBUG_HC
+  local SOURCE_IP_MODE SOURCE_IPS SOURCE_IP_REFRESH SOURCE_IP_CONNECT_TIMEOUT SOURCE_IP_FAILS_TO_SWITCH
+  local OLD_REMOTE_SOCKS_PORT
+
+  if [[ "$exists" == "YES" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+    OLD_REMOTE_SOCKS_PORT="${REMOTE_SOCKS_PORT:-${PORT_SPEC:-}}"
+  fi
+
+  section "Reverse profile: $profile"
+  echo "Opens one SOCKS5 proxy on the REMOTE server via SSH -R dynamic forwarding."
+  prompt_default "Remote host/IP" "${REMOTE_HOST:-}" REMOTE_HOST
+  prompt_default "Remote SSH port" "${REMOTE_PORT:-22}" REMOTE_PORT
+  prompt_default "Remote SSH user" "${REMOTE_USER:-root}" REMOTE_USER
+  prompt_remote_bind_mode REMOTE_BIND_ADDR "${REMOTE_BIND_ADDR:-127.0.0.1}"
+
+  local p ports_ok
+  while true; do
+    prompt_default "Remote SOCKS port (on destination server)" "${REMOTE_SOCKS_PORT:-${OLD_REMOTE_SOCKS_PORT:-1080}}" REMOTE_SOCKS_PORT
+    is_port "$REMOTE_SOCKS_PORT" || { warn "Invalid port."; continue; }
+    ports_ok="YES"
+    break
+  done
+
+  if [[ -n "${CIPHERS:-}" ]]; then
+    prompt_yesno "Change SSH cipher? (current: $CIPHERS)" "NO" overwrite
+    if [[ "$overwrite" == "YES" ]]; then
+      prompt_cipher_choice CIPHERS
+    fi
+  else
+    prompt_cipher_choice CIPHERS
+  fi
+
+  prompt_default "RekeyLimit" "${REKEY_LIMIT:-4G 1h}" REKEY_LIMIT
+  prompt_default "ServerAliveInterval" "${SERVER_ALIVE_INTERVAL:-30}" SA_INT
+  prompt_default "ServerAliveCountMax" "${SERVER_ALIVE_COUNTMAX:-3}" SA_CNT
+
+  KNOWN_HOSTS_FILE="${KNOWN_HOSTS_FILE:-$KNOWN_HOSTS_FILE_DEFAULT}"
+  prompt_default "Known hosts file" "$KNOWN_HOSTS_FILE" KNOWN_HOSTS_FILE
+
+  local host_tag
+  host_tag="$(safe_tag "$REMOTE_HOST")"
+  prompt_default "SSH private key path" "${KEY_PATH:-${ROOT_SSH_DIR}/id_ed25519_rev_${host_tag}_p${REMOTE_PORT}}" KEY_PATH
+  prompt_yesno "Generate key if missing?" "YES" GEN_KEY
+  prompt_yesno "Install public key on remote using password?" "${INSTALL_KEY:-YES}" INSTALL_KEY
+
+  prompt_default "Health URLs (comma-separated)" "${HC_URLS:-$DEFAULT_HC_URLS}" HC_URLS
+  prompt_default "Health timeout (sec)" "${HC_TIMEOUT:-5}" HC_TIMEOUT
+  prompt_default "Health retries" "${HC_RETRIES:-2}" HC_RETRIES
+  prompt_default "Health interval (sec)" "${HC_INTERVAL:-15}" HC_INTERVAL
+  prompt_default "Fails before restart" "${HC_FAILS_TO_RESTART:-3}" HC_FAILS
+  prompt_default "Heartbeat every N checks" "${HEARTBEAT_EVERY:-20}" HEARTBEAT_EVERY
+  prompt_yesno "Enable detailed health debug logs?" "${DEBUG_HEALTHCHECK:-NO}" DEBUG_HC
+
+  echo "  Health checks run ON the remote server (curl via remote SOCKS)."
+  SOURCE_IP_MODE="${SOURCE_IP_MODE:-auto}"
+  SOURCE_IPS="${SOURCE_IPS:-}"
+  SOURCE_IP_REFRESH="${SOURCE_IP_REFRESH:-60}"
+  SOURCE_IP_CONNECT_TIMEOUT="${SOURCE_IP_CONNECT_TIMEOUT:-12}"
+  SOURCE_IP_FAILS_TO_SWITCH="${SOURCE_IP_FAILS_TO_SWITCH:-3}"
+
+  prompt_yesno "Enable this profile right after deploy?" "${PROFILE_ENABLED:-YES}" PROFILE_ENABLED
+
+  mkdir -p "$ROOT_SSH_DIR"
+  chmod 700 "$ROOT_SSH_DIR"
+  touch "$KNOWN_HOSTS_FILE"
+  chmod 600 "$KNOWN_HOSTS_FILE" || true
+
+  if [[ ! -f "$KEY_PATH" ]]; then
+    if [[ "$GEN_KEY" == "YES" ]]; then
+      log "Generating key: $KEY_PATH"
+      ssh-keygen -t ed25519 -a 64 -N '' -f "$KEY_PATH" >/dev/null
+      ok "Key generated."
+    else
+      die "Key missing and generation declined."
+    fi
+  fi
+  chmod 600 "$KEY_PATH" || true
+  [[ -f "${KEY_PATH}.pub" ]] || die "Missing public key: ${KEY_PATH}.pub"
+
+  SSH_ALIAS="ssh_tun_rev_${profile}"
+  write_ssh_config_host "$SSH_ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" "$KEY_PATH" "$KNOWN_HOSTS_FILE"
+
+  if [[ "$INSTALL_KEY" == "YES" ]]; then
+    local attempt
+    for attempt in 1 2 3; do
+      log "Password auth probe ${attempt}/3"
+      if remote_password_probe "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KNOWN_HOSTS_FILE"; then
+        ok "Password auth works."
+        break
+      fi
+      [[ "$attempt" -eq 3 ]] && die "Password probe failed after 3 attempts."
+    done
+
+    for attempt in 1 2 3; do
+      log "Installing pubkey ${attempt}/3"
+      if remote_install_pubkey_via_password "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "${KEY_PATH}.pub" "$KNOWN_HOSTS_FILE"; then
+        ok "Public key installed."
+        break
+      fi
+      [[ "$attempt" -eq 3 ]] && die "Failed to install key after 3 attempts."
+    done
+  fi
+
+  if remote_test_key "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KEY_PATH" "$KNOWN_HOSTS_FILE"; then
+    ok "Key auth test passed."
+  else
+    warn "Key auth test failed. Tunnel may not start until SSH key access works."
+  fi
+
+  if remote_port_in_use "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PORT" "$KEY_PATH" "$KNOWN_HOSTS_FILE" "$REMOTE_SOCKS_PORT"; then
+    if [[ "$exists" == "YES" && "$REMOTE_SOCKS_PORT" == "$OLD_REMOTE_SOCKS_PORT" ]]; then
+      log "Remote port ${REMOTE_SOCKS_PORT} already in use (may be this profile)."
+    else
+      warn "Remote port ${REMOTE_SOCKS_PORT} is already listening on ${REMOTE_HOST}."
+      prompt_yesno "Continue anyway?" "NO" overwrite
+      [[ "$overwrite" == "YES" ]] || die "Cancelled."
+    fi
+  fi
+
+  write_profile_env "$profile" "$REMOTE_HOST" "$REMOTE_PORT" "$REMOTE_USER" "$KEY_PATH" "$REMOTE_BIND_ADDR" "$REMOTE_SOCKS_PORT" \
+    "" "" "NO" "$CIPHERS" "$REKEY_LIMIT" "$SA_INT" "$SA_CNT" "$KNOWN_HOSTS_FILE" "$SSH_ALIAS" "$PROFILE_ENABLED" \
+    "$HC_URLS" "$HC_TIMEOUT" "$HC_RETRIES" "$HC_INTERVAL" "$HC_FAILS" "$HEARTBEAT_EVERY" "$DEBUG_HC" \
+    "$SOURCE_IP_MODE" "$SOURCE_IPS" "$SOURCE_IP_REFRESH" "$SOURCE_IP_CONNECT_TIMEOUT" "$SOURCE_IP_FAILS_TO_SWITCH" \
+    "reverse" "$REMOTE_SOCKS_PORT" "$REMOTE_BIND_ADDR"
 
   deploy_profile "$profile"
 }
@@ -1954,6 +2386,18 @@ cmd_doctor() {
   ok "Runtime assets validated."
 }
 
+cmd_create_reverse() {
+  need_root
+  ensure_dirs
+  create_or_update_reverse_profile_interactive "create" "$1"
+}
+
+cmd_update_reverse() {
+  need_root
+  ensure_dirs
+  create_or_update_reverse_profile_interactive "update" "$1"
+}
+
 cmd_create() {
   need_root
   ensure_dirs
@@ -1978,18 +2422,19 @@ main_menu() {
     echo "Options:"
     echo "  1) Install/upgrade prerequisites"
     echo "  2) List profiles"
-    echo "  3) Create new profile"
-    echo "  4) Update existing profile"
-    echo "  5) Enable profile"
-    echo "  6) Disable profile"
-    echo "  7) Delete profile"
-    echo "  8) Profile status"
-    echo "  9) Profile logs (follow)"
-    echo "  10) Install command to /usr/local/bin/ssh-tun"
-    echo "  11) Optimize THIS server (network/sysctl/limits)"
-    echo "  12) Optimize REMOTE server of a profile (sshd/sysctl)"
-    echo "  13) Update program from GitHub (optional)"
-    echo "  14) Uninstall ssh-tun from this server"
+    echo "  3) Create forward profile (local SOCKS)"
+    echo "  4) Create reverse profile (remote SOCKS via -R)"
+    echo "  5) Update existing profile"
+    echo "  6) Enable profile"
+    echo "  7) Disable profile"
+    echo "  8) Delete profile"
+    echo "  9) Profile status"
+    echo "  10) Profile logs (follow)"
+    echo "  11) Install command to /usr/local/bin/ssh-tun"
+    echo "  12) Optimize THIS server (network/sysctl/limits)"
+    echo "  13) Optimize REMOTE server of a profile (sshd/sysctl)"
+    echo "  14) Update program from GitHub (optional)"
+    echo "  15) Uninstall ssh-tun from this server"
     echo "  0) Exit"
     echo
     echo "Tip: for profile actions, type 'b' to go back to this menu."
@@ -1999,41 +2444,51 @@ main_menu() {
       1) ( cmd_doctor ) || true ;;
       2) ( list_profiles ) || true ;;
       3)
-        read -r -p "New profile name (or b to back): " profile || true
+        read -r -p "New forward profile name (or b to back): " profile || true
         [[ "${profile:-}" == "b" || "${profile:-}" == "B" || -z "${profile:-}" ]] || ( cmd_create "$profile" ) || true
         ;;
       4)
-        profile="$(choose_profile_interactive || true)"
-        [[ -n "$profile" ]] && ( cmd_update "$profile" ) || true
+        read -r -p "New reverse profile name (or b to back): " profile || true
+        [[ "${profile:-}" == "b" || "${profile:-}" == "B" || -z "${profile:-}" ]] || ( cmd_create_reverse "$profile" ) || true
         ;;
       5)
         profile="$(choose_profile_interactive || true)"
-        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "YES" ) || true
+        [[ -n "$profile" ]] || continue
+        env_file="$(profile_env_path "$profile")"
+        if is_reverse_profile_file "$env_file"; then
+          ( cmd_update_reverse "$profile" ) || true
+        else
+          ( cmd_update "$profile" ) || true
+        fi
         ;;
       6)
         profile="$(choose_profile_interactive || true)"
-        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "NO" ) || true
+        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "YES" ) || true
         ;;
       7)
         profile="$(choose_profile_interactive || true)"
-        [[ -n "$profile" ]] && ( remove_profile "$profile" ) || true
+        [[ -n "$profile" ]] && ( set_profile_enabled "$profile" "NO" ) || true
         ;;
       8)
         profile="$(choose_profile_interactive || true)"
-        [[ -n "$profile" ]] && ( show_profile_status "$profile" ) || true
+        [[ -n "$profile" ]] && ( remove_profile "$profile" ) || true
         ;;
       9)
         profile="$(choose_profile_interactive || true)"
+        [[ -n "$profile" ]] && ( show_profile_status "$profile" ) || true
+        ;;
+      10)
+        profile="$(choose_profile_interactive || true)"
         [[ -n "$profile" ]] && ( show_profile_logs "$profile" "YES" ) || true
         ;;
-      10) ( install_cli ) || true ;;
-      11) ( optimize_local ) || true ;;
-      12)
+      11) ( install_cli ) || true ;;
+      12) ( optimize_local ) || true ;;
+      13)
         profile="$(choose_profile_interactive || true)"
         [[ -n "$profile" ]] && ( optimize_remote "$profile" ) || true
         ;;
-      13) ( cmd_self_update ) || true ;;
-      14) ( cmd_uninstall ) || true ;;
+      14) ( cmd_self_update ) || true ;;
+      15) ( cmd_uninstall ) || true ;;
       0) break ;;
       *) warn "Invalid option." ;;
     esac
@@ -2051,8 +2506,10 @@ Usage:
   ssh-tun install                # install command to /usr/local/bin/ssh-tun
   ssh-tun doctor                 # check/install prereqs + refresh runtime assets
   ssh-tun list                   # list profiles
-  ssh-tun create <profile>       # create profile and deploy
-  ssh-tun update <profile>       # update profile and redeploy
+  ssh-tun create <profile>           # create forward profile (local SOCKS) and deploy
+  ssh-tun create-reverse <profile>    # create reverse profile (remote SOCKS via -R) and deploy
+  ssh-tun update <profile>            # update forward profile and redeploy
+  ssh-tun update-reverse <profile>  # update reverse profile and redeploy
   ssh-tun enable <profile>       # enable/start profile
   ssh-tun disable <profile>      # disable/stop profile
   ssh-tun delete <profile>       # remove profile and units
@@ -2074,7 +2531,9 @@ main() {
     doctor) shift; cmd_doctor ;;
     list) shift; need_root; ensure_dirs; list_profiles ;;
     create) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_create "$1" ;;
+    create-reverse) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_create_reverse "$1" ;;
     update) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_update "$1" ;;
+    update-reverse) shift; [[ $# -ge 1 ]] || die "Profile name required."; cmd_update_reverse "$1" ;;
     enable) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; set_profile_enabled "$1" "YES" ;;
     disable) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; set_profile_enabled "$1" "NO" ;;
     delete) shift; [[ $# -ge 1 ]] || die "Profile name required."; need_root; remove_profile "$1" ;;
