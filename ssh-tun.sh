@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.5.0"
+VERSION="v9.5.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -202,7 +202,8 @@ _version_key() {
 }
 
 version_newer_than() {
-  [[ "$(_version_key "$1")" -gt "$(_version_key "$2")" ]]
+  # Zero-padded keys are fixed-width; use lexicographic compare (bash -gt overflows).
+  [[ "$(_version_key "$1")" > "$(_version_key "$2")" ]]
 }
 
 _fetch_latest_version_remote() {
