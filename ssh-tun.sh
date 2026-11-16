@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.5.2"
+VERSION="v9.5.3"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -298,7 +298,7 @@ maybe_show_update_notice() {
   check_for_update >/dev/null 2>&1 || return 0
   if [[ "$UPDATE_AVAILABLE" == "YES" && -n "$UPDATE_LATEST_VERSION" ]]; then
     echo
-    echo "  >>> Update available: ${VERSION} -> ${UPDATE_LATEST_VERSION}  (option 13: update program from GitHub)"
+    echo "  >>> Update available: ${VERSION} -> ${UPDATE_LATEST_VERSION}  (option 14: update program from GitHub)"
   fi
 }
 
@@ -313,7 +313,7 @@ cmd_check_update() {
   fi
   if [[ "$UPDATE_AVAILABLE" == "YES" ]]; then
     ok "New version available: ${UPDATE_LATEST_VERSION} (installed: ${VERSION})"
-    log "Run: ssh-tun self-update   or choose menu option 13"
+    log "Run: ssh-tun self-update   or choose menu option 14"
   else
     ok "You are on the latest known release (${VERSION})."
   fi
@@ -575,7 +575,7 @@ refresh_public_ips() {
 
   if [[ "$SOURCE_IP_MODE" != "none" ]]; then
     family="$(remote_ip_family)"
-    if [[ "$SOURCE_IP_MODE" == "manual" ]]; then
+    if [[ "$SOURCE_IP_MODE" != "auto" && -n "${SOURCE_IPS_MANUAL// /}" ]]; then
       IFS=',' read -r -a manual <<< "${SOURCE_IPS_MANUAL// /}"
       for addr in "${manual[@]}"; do
         if [[ "$family" == 6 && "$addr" == *:* ]] ||
@@ -616,6 +616,23 @@ refresh_public_ips() {
 maybe_refresh_public_ips() {
   (( SECONDS - LAST_IP_REFRESH >= SOURCE_IP_REFRESH )) || return 0
   refresh_public_ips
+}
+
+# Choose a fresh preferred source after a running tunnel fails.
+pick_source_ip() {
+  local exclude="$1" addr idx
+  local -a pool=()
+  refresh_public_ips
+  if (( ${#PUBLIC_IPS[@]} <= 1 )); then
+    CURRENT_SOURCE_IP="${PUBLIC_IPS[0]:-}"
+    return 0
+  fi
+  for addr in "${PUBLIC_IPS[@]}"; do
+    [[ "$addr" == "$exclude" ]] || pool+=("$addr")
+  done
+  (( ${#pool[@]} > 0 )) || pool=("${PUBLIC_IPS[@]}")
+  idx=$((RANDOM % ${#pool[@]}))
+  CURRENT_SOURCE_IP="${pool[$idx]}"
 }
 
 build_reverse_forwards() {
@@ -842,33 +859,48 @@ kill_ssh() {
 # Try each available public IP (shuffled) until SSH+SOCKS comes up or all fail.
 start_tunnel_with_source_rotation() {
   local -a try_order=() rotated=()
-  local addr i j n old_random previous_source=""
+  local addr i j n old_random preferred_source=""
   SWITCH_SOURCE=0
   refresh_public_ips
 
-  try_order=("${PUBLIC_IPS[@]}")
-  if (( ${#try_order[@]} > 1 )); then
-    # Spread instances across IPs using the profile and port as a seed.
-    old_random=$RANDOM
-    RANDOM=$(( (SOCKS_PORT * 9973 + ${#PROFILE_ID} * 17) % 32768 ))
-    for ((i=${#try_order[@]}-1; i>0; i--)); do
-      j=$((RANDOM % (i + 1)))
-      addr="${try_order[$i]}"
-      try_order[$i]="${try_order[$j]}"
-      try_order[$j]="$addr"
-    done
-    RANDOM=$old_random
+  if (( ${#PUBLIC_IPS[@]} <= 1 )); then
+    CURRENT_SOURCE_IP="${PUBLIC_IPS[0]:-}"
+    build_ssh_opts
+    start_ssh_bg
+    if wait_tunnel_ready; then
+      log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=${CURRENT_SOURCE_IP:-default}"
+      return 0
+    fi
+    warn "tunnel failed: instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default}"
+    kill_ssh
+    return 1
+  fi
 
-    # Retry the previous source last if it still exists in the refreshed pool.
+  # Spread instances across IPs using the profile and port as a seed.
+  old_random=$RANDOM
+  RANDOM=$(( (SOCKS_PORT * 9973 + ${#PROFILE_ID} * 17) % 32768 ))
+  try_order=("${PUBLIC_IPS[@]}")
+  for ((i=${#try_order[@]}-1; i>0; i--)); do
+    j=$((RANDOM % (i + 1)))
+    addr="${try_order[$i]}"
+    try_order[$i]="${try_order[$j]}"
+    try_order[$j]="$addr"
+  done
+  RANDOM=$old_random
+
+  if [[ -n "$CURRENT_SOURCE_IP" ]]; then
+    # Try the source chosen by pick_source_ip first if it is still assigned.
     for addr in "${try_order[@]}"; do
       if [[ "$addr" == "$CURRENT_SOURCE_IP" ]]; then
-        previous_source="$addr"
+        preferred_source="$addr"
       else
         rotated+=("$addr")
       fi
     done
-    [[ -z "$previous_source" ]] || rotated+=("$previous_source")
     try_order=("${rotated[@]}")
+    if [[ -n "$preferred_source" ]]; then
+      try_order=("$preferred_source" "${try_order[@]}")
+    fi
   fi
 
   n=${#try_order[@]}
@@ -888,11 +920,9 @@ start_tunnel_with_source_rotation() {
   CURRENT_SOURCE_IP=""
   build_ssh_opts
   start_ssh_bg
-  if (( n > 0 )); then
-    log "fallback without BindAddress: instance=$INSTANCE pid=$SSH_PID"
-  fi
+  log "fallback without BindAddress: instance=$INSTANCE pid=$SSH_PID"
   if wait_tunnel_ready; then
-    log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=default"
+    log "tunnel started (no bind): profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID"
     return 0
   fi
   kill_ssh
@@ -942,6 +972,7 @@ while true; do
 
       if (( FAILS >= SOURCE_IP_FAILS_TO_SWITCH && ${#PUBLIC_IPS[@]} > 1 )); then
         warn "switching outbound source IP after ${FAILS} failures: instance=$INSTANCE was=${CURRENT_SOURCE_IP:-default}"
+        pick_source_ip "$CURRENT_SOURCE_IP"
         kill_ssh
         SWITCH_SOURCE=1
         break
@@ -967,7 +998,8 @@ while true; do
     SSH_PID=""
   fi
   if (( ${#PUBLIC_IPS[@]} > 1 )); then
-    warn "ssh exited: instance=$INSTANCE; trying another source IP in 2s"
+    pick_source_ip "$CURRENT_SOURCE_IP"
+    warn "ssh exited: instance=$INSTANCE; try next source=${CURRENT_SOURCE_IP:-default} in 2s"
   else
     warn "ssh exited: instance=$INSTANCE; restart in 2s"
   fi

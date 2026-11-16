@@ -44,8 +44,8 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Multi-public-IP rotation** – each tunnel picks a local public address of the same family as the SSH destination (`ssh BindAddress`), rotates on connection or health-check failures, and refreshes the IPv4 or IPv6 pool when addresses change.
 - **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
 - **Reverse dynamic SOCKS** – optional profile type that opens a single SOCKS5 proxy on the **remote** server via `ssh -R` (bind internal `127.0.0.1`+`::1` by default, or all interfaces `0.0.0.0`+`::`); health checks run on the remote via `curl` through the proxy.
-- **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 13); failures are non-fatal if GitHub is unreachable.
-- **Full server uninstall** – remove all profiles, units, and installed files from the host (`uninstall`, menu option 14); optional retention of tuning files and cleanup of SSH config entries.
+- **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 14); failures are non-fatal if GitHub is unreachable.
+- **Full server uninstall** – remove all profiles, units, and installed files from the host (`uninstall`, menu option 15); optional retention of tuning files and cleanup of SSH config entries.
 - **Single file, no dependencies to build** – just a Bash script.
 
 ## How it works
@@ -115,19 +115,21 @@ sudo ./ssh-tun.sh create myserver
 
 From v9.3.0 onward you can optionally pull newer releases from this GitHub repository. Updates are **never required** — if GitHub is unreachable, the tool keeps running at your installed version with no error spam.
 
-- **Menu:** option **13) Update program from GitHub (optional)**
+- **Menu:** option **14) Update program from GitHub (optional)**
 - **CLI:** `ssh-tun check-update` — query GitHub (API or raw script) for a newer tag
 - **CLI:** `ssh-tun self-update` — download and install the latest script to `/usr/local/bin/ssh-tun` (use `--yes` to skip confirmation)
 
 The interactive menu may show a one-line notice when a newer version is available. Failed checks are cached briefly so offline hosts are not hammered.
 
-After updating from v9.5.1, regenerate the supervisor with the new CLI and restart the running tunnel services to apply IPv6 source selection to existing profiles.
+After updating from v9.5.2 or earlier with `self-update`, regenerate the supervisor with the new CLI and restart the running tunnel services to apply the runtime changes to existing profiles.
 
 ```bash
 sudo ssh-tun self-update
 sudo ssh-tun doctor
 sudo systemctl try-restart 'ssh-tun@*.service'
 ```
+
+For an installation without `self-update`, download `ssh-tun.sh` from the tag shown on the [latest release](https://github.com/metasina3/ssh-tun/releases/latest) and run `sudo bash ssh-tun.sh install`. Use `ssh-tun --help` to check the installed version.
 
 ## Usage
 
@@ -143,18 +145,19 @@ sudo ssh-tun
 Options:
   1) Install/upgrade prerequisites
   2) List profiles
-  3) Create new profile
-  4) Update existing profile
-  5) Enable profile
-  6) Disable profile
-  7) Delete profile
-  8) Profile status
-  9) Profile logs (follow)
-  10) Install command to /usr/local/bin/ssh-tun
-  11) Optimize THIS server (network/sysctl/limits)
-  12) Optimize REMOTE server of a profile (sshd/sysctl)
-  13) Update program from GitHub (optional)
-  14) Uninstall ssh-tun from this server
+  3) Create forward profile (local SOCKS)
+  4) Create reverse profile (remote SOCKS via -R)
+  5) Update existing profile
+  6) Enable profile
+  7) Disable profile
+  8) Delete profile
+  9) Profile status
+  10) Profile logs (follow)
+  11) Install command to /usr/local/bin/ssh-tun
+  12) Optimize THIS server (network/sysctl/limits)
+  13) Optimize REMOTE server of a profile (sshd/sysctl)
+  14) Update program from GitHub (optional)
+  15) Uninstall ssh-tun from this server
   0) Exit
 ```
 
@@ -242,14 +245,22 @@ Default health URLs (first = highest priority): `https://www.google.com/generate
 
 Forward and reverse tunnels use local public IPv4 addresses for IPv4 destinations and local global unicast IPv6 addresses for IPv6 destinations. Hostnames with both IPv4 and IPv6 DNS records use the IPv4 pool. IPv6-only hostnames use the IPv6 pool.
 
-If several addresses match, the supervisor spreads instances across them and tries other addresses when SSH fails to connect or the tunnel fails its health checks. It rotates after **3 consecutive health-check failures** by default, refreshes the pool every **60 seconds**, and logs changes. If the pool is empty or its addresses fail, the supervisor lets the OS select the source address for the SSH connection.
+If several addresses match, each tunnel instance automatically:
+
+1. Detects global addresses in the destination's IP family.
+2. Picks one per instance (`ssh -o BindAddress=…`) to spread load across the pool.
+3. Retries other addresses when SSH fails to connect or the tunnel fails its health checks.
+4. Switches to another address after **3 consecutive health-check failures** by default.
+5. Refreshes the pool every **60 seconds** and logs changes.
+
+With one eligible address, the tunnel binds to that address. With an empty pool, or after all addresses in a multi-address pool fail, the OS selects the source address.
 
 Profile env keys (optional, defaults shown):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SOURCE_IP_MODE` | `auto` | `auto` = detect public IPs; `none` = no BindAddress; `manual` = use `SOURCE_IPS` |
-| `SOURCE_IPS` | *(empty)* | Comma-separated IP literals in `manual` mode, such as `2001:db8::11,2001:db8::12`. The supervisor uses entries that match the destination family. |
+| `SOURCE_IPS` | *(empty)* | Comma-separated IP literals in `manual` mode, such as `2001:db8::11,2001:db8::12`. The supervisor uses entries that match the destination family and auto-detects when the list is empty. |
 | `SOURCE_IP_REFRESH` | `60` | Seconds between IP pool rescans |
 | `SOURCE_IP_CONNECT_TIMEOUT` | `12` | Seconds to wait for SSH+SOCKS to come up |
 | `SOURCE_IP_FAILS_TO_SWITCH` | `3` | Health failures before switching to another IP |
@@ -342,7 +353,7 @@ journalctl -u 'ssh-tun@myserver__1660.service' -f
 
 ## Uninstall
 
-From v9.4.0 you can remove **ssh-tun** entirely from the local server with one command (or menu option **14**). This stops all tunnel services, deletes profiles and program files, and reloads `systemd`. SSH private keys under `~/.ssh` are **not** deleted.
+From v9.4.0 you can remove **ssh-tun** entirely from the local server with one command (or menu option **15**). This stops all tunnel services, deletes profiles and program files, and reloads `systemd`. SSH private keys under `~/.ssh` are **not** deleted.
 
 ```bash
 sudo ssh-tun uninstall
@@ -350,7 +361,7 @@ sudo ssh-tun uninstall
 
 Interactive prompts ask whether to remove local network tuning (sysctl/limits/BBR module load) and whether to strip `Host` blocks that ssh-tun added to `~/.ssh/config`.
 
-**Menu:** option **14) Uninstall ssh-tun from this server**
+**Menu:** option **15) Uninstall ssh-tun from this server**
 
 **Flags:**
 
