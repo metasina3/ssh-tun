@@ -41,7 +41,7 @@ It turns one or more remote SSH servers into local SOCKS5 proxies, runs each tun
 - **Profiles** – named, editable configurations for different remote servers; create/update/enable/disable/delete from a menu or CLI.
 - **Automatic key setup** – generates an `ed25519` key and installs it on the remote via password auth (one-time), then switches to key-only auth.
 - **Max-bandwidth optimization** – one command applies BBR + `fq`, large TCP buffers, and high file-descriptor limits on **both** the local host and the remote server (with `sshd -t` validation before reload).
-- **Multi-public-IP rotation** – when the local host has several public IPv4 addresses, each tunnel automatically picks one (`ssh BindAddress`), rotates on connect/health failures, and refreshes the IP pool when addresses are added or removed.
+- **Multi-public-IP rotation** – each tunnel picks a local public address of the same family as the SSH destination (`ssh BindAddress`), rotates on connection or health-check failures, and refreshes the IPv4 or IPv6 pool when addresses change.
 - **Dual-stack SOCKS** – loopback proxies listen on both `127.0.0.1` and `::1` by default.
 - **Reverse dynamic SOCKS** – optional profile type that opens a single SOCKS5 proxy on the **remote** server via `ssh -R` (bind internal `127.0.0.1`+`::1` by default, or all interfaces `0.0.0.0`+`::`); health checks run on the remote via `curl` through the proxy.
 - **Optional self-update** – check GitHub for newer releases and upgrade in place (`check-update`, `self-update`, menu option 13); failures are non-fatal if GitHub is unreachable.
@@ -121,6 +121,14 @@ From v9.3.0 onward you can optionally pull newer releases from this GitHub repos
 
 The interactive menu may show a one-line notice when a newer version is available. Failed checks are cached briefly so offline hosts are not hammered.
 
+After updating from v9.5.1, regenerate the supervisor with the new CLI and restart the running tunnel services to apply IPv6 source selection to existing profiles.
+
+```bash
+sudo ssh-tun self-update
+sudo ssh-tun doctor
+sudo systemctl try-restart 'ssh-tun@*.service'
+```
+
 ## Usage
 
 ### Interactive menu
@@ -183,7 +191,7 @@ When you `create` or `update` a forward profile, the tool will ask for:
 
 | Prompt | Meaning |
 | --- | --- |
-| Remote host/IP, port, user | The SSH server abroad |
+| Remote host/IP, port, user | The SSH server abroad. Enter an IPv6 address without brackets, such as `2001:db8::10`. |
 | Local bind address | Usually `127.0.0.1` — **listens on both `127.0.0.1` and `::1`** by default (IPv6 added only when available). Use `0.0.0.0` for all v4+v6, or a specific IP/IPv6 literal |
 | Normal SOCKS ports | Ports that run as plain tunnels |
 | Pinned-per-core SOCKS ports | Ports pinned to CPU cores via `taskset` |
@@ -232,20 +240,16 @@ Default health URLs (first = highest priority): `https://www.google.com/generate
 
 ### Outbound public IP rotation (auto)
 
-If your local server has **more than one public IPv4**, each tunnel instance automatically:
+Forward and reverse tunnels use local public IPv4 addresses for IPv4 destinations and local global unicast IPv6 addresses for IPv6 destinations. Hostnames with both IPv4 and IPv6 DNS records use the IPv4 pool. IPv6-only hostnames use the IPv6 pool.
 
-1. Detects global addresses (`ip -4 addr show scope global`).
-2. Picks one at random per instance (`ssh -o BindAddress=…`) to spread load across all IPs.
-3. Retries other IPs in a loop when SSH connect or SOCKS health check fails (with timeout).
-4. Switches to another IP after **3 consecutive health-check failures** on the current IP (configurable).
-5. Refreshes the IP list every **60 seconds** and logs when addresses are added or removed.
+If several addresses match, the supervisor spreads instances across them and tries other addresses when SSH fails to connect or the tunnel fails its health checks. It rotates after **3 consecutive health-check failures** by default, refreshes the pool every **60 seconds**, and logs changes. If the pool is empty or its addresses fail, the supervisor lets the OS select the source address for the SSH connection.
 
 Profile env keys (optional, defaults shown):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SOURCE_IP_MODE` | `auto` | `auto` = detect public IPs; `none` = no BindAddress; `manual` = use `SOURCE_IPS` |
-| `SOURCE_IPS` | *(empty)* | Comma list when mode is `manual` |
+| `SOURCE_IPS` | *(empty)* | Comma-separated IP literals in `manual` mode, such as `2001:db8::11,2001:db8::12`. The supervisor uses entries that match the destination family. |
 | `SOURCE_IP_REFRESH` | `60` | Seconds between IP pool rescans |
 | `SOURCE_IP_CONNECT_TIMEOUT` | `12` | Seconds to wait for SSH+SOCKS to come up |
 | `SOURCE_IP_FAILS_TO_SWITCH` | `3` | Health failures before switching to another IP |

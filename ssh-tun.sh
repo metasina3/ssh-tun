@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v9.5.1"
+VERSION="v9.5.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 
 APP_NAME="ssh-tun"
@@ -553,24 +553,51 @@ is_private_ipv4() {
   return 1
 }
 
-# Discover global (public) IPv4 addresses, or use a manual list from the profile.
-refresh_public_ips() {
-  local -a found=() manual=() ip old_csv
-  old_csv="$PUBLIC_IPS_CSV"
-  found=()
+# Preserve IPv4 selection for dual-stack hostnames and use IPv6 for IPv6-only hosts.
+remote_ip_family() {
+  case "$REMOTE_HOST" in
+    *:*) printf '6\n' ;;
+    *[!0-9.]*)
+      getent ahosts -- "$REMOTE_HOST" 2>/dev/null | awk '
+        $2 == "STREAM" && $1 ~ /:/ { ipv6 = 1 }
+        $2 == "STREAM" && $1 !~ /:/ { ipv4 = 1 }
+        END { print (ipv6 && !ipv4 ? 6 : 4) }
+      ' || true
+      ;;
+    *) printf '4\n' ;;
+  esac
+}
 
-  if [[ -n "${SOURCE_IPS_MANUAL// /}" && "$SOURCE_IP_MODE" != "auto" ]]; then
-    IFS=',' read -r -a manual <<< "${SOURCE_IPS_MANUAL// /}"
-    for ip in "${manual[@]}"; do
-      [[ -n "$ip" ]] || continue
-      found+=("$ip")
-    done
-  elif [[ "$SOURCE_IP_MODE" != "none" ]]; then
-    while IFS= read -r ip; do
-      [[ -n "$ip" ]] || continue
-      is_private_ipv4 "$ip" && continue
-      found+=("$ip")
-    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u)
+# Discover public addresses of the destination's family, or use the profile's list.
+refresh_public_ips() {
+  local -a found=() manual=() flags=()
+  local addr family old_csv="$PUBLIC_IPS_CSV"
+
+  if [[ "$SOURCE_IP_MODE" != "none" ]]; then
+    family="$(remote_ip_family)"
+    if [[ "$SOURCE_IP_MODE" == "manual" ]]; then
+      IFS=',' read -r -a manual <<< "${SOURCE_IPS_MANUAL// /}"
+      for addr in "${manual[@]}"; do
+        if [[ "$family" == 6 && "$addr" == *:* ]] ||
+           [[ "$family" == 4 && -n "$addr" && "$addr" != *:* ]]; then
+          found+=("$addr")
+        fi
+      done
+    else
+      if [[ "$family" == 6 ]]; then
+        flags=(-tentative -dadfailed -deprecated)
+      fi
+      while IFS= read -r addr; do
+        if [[ "$family" == 6 ]]; then
+          # Linux also reports unique-local addresses with scope global.
+          [[ "$addr" =~ ^[23][[:xdigit:]]{3}: ]] || continue
+        else
+          [[ -n "$addr" ]] || continue
+          is_private_ipv4 "$addr" && continue
+        fi
+        found+=("$addr")
+      done < <(ip "-$family" -o addr show scope global "${flags[@]}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u)
+    fi
   fi
 
   PUBLIC_IPS=("${found[@]}")
@@ -589,28 +616,6 @@ refresh_public_ips() {
 maybe_refresh_public_ips() {
   (( SECONDS - LAST_IP_REFRESH >= SOURCE_IP_REFRESH )) || return 0
   refresh_public_ips
-}
-
-# Pick a random outbound source IP, optionally excluding the current one.
-pick_source_ip() {
-  local exclude="${1:-}" pick idx
-  refresh_public_ips
-  if (( ${#PUBLIC_IPS[@]} == 0 )); then
-    CURRENT_SOURCE_IP=""
-    return 0
-  fi
-  if (( ${#PUBLIC_IPS[@]} == 1 )); then
-    CURRENT_SOURCE_IP="${PUBLIC_IPS[0]}"
-    return 0
-  fi
-  local -a pool=()
-  for ip in "${PUBLIC_IPS[@]}"; do
-    [[ "$ip" == "$exclude" ]] && continue
-    pool+=("$ip")
-  done
-  (( ${#pool[@]} > 0 )) || pool=("${PUBLIC_IPS[@]}")
-  idx=$((RANDOM % ${#pool[@]}))
-  CURRENT_SOURCE_IP="${pool[$idx]}"
 }
 
 build_reverse_forwards() {
@@ -836,46 +841,33 @@ kill_ssh() {
 
 # Try each available public IP (shuffled) until SSH+SOCKS comes up or all fail.
 start_tunnel_with_source_rotation() {
-  local -a try_order=() ip i n old_random
+  local -a try_order=() rotated=()
+  local addr i j n old_random previous_source=""
   SWITCH_SOURCE=0
   refresh_public_ips
 
-  if (( ${#PUBLIC_IPS[@]} <= 1 )); then
-    if (( ${#PUBLIC_IPS[@]} == 1 )); then
-      CURRENT_SOURCE_IP="${PUBLIC_IPS[0]}"
-    else
-      CURRENT_SOURCE_IP=""
-    fi
-    build_ssh_opts
-    start_ssh_bg
-    if wait_tunnel_ready; then
-      log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=${CURRENT_SOURCE_IP:-default}"
-      return 0
-    fi
-    warn "tunnel failed: instance=$INSTANCE source=${CURRENT_SOURCE_IP:-default}"
-    kill_ssh
-    return 1
-  fi
-
-  # Spread instances across IPs; re-shuffle on each full rotation pass.
-  old_random=$RANDOM
-  RANDOM=$(( (SOCKS_PORT * 9973 + ${#PROFILE_ID} * 17) % 32768 ))
   try_order=("${PUBLIC_IPS[@]}")
-  for ((i=${#try_order[@]}-1; i>0; i--)); do
-    j=$((RANDOM % (i + 1)))
-    ip="${try_order[$i]}"
-    try_order[$i]="${try_order[$j]}"
-    try_order[$j]="$ip"
-  done
-  RANDOM=$old_random
-
-  if [[ -n "$CURRENT_SOURCE_IP" ]]; then
-    local -a rotated=()
-    for ip in "${try_order[@]}"; do
-      [[ "$ip" == "$CURRENT_SOURCE_IP" ]] && continue
-      rotated+=("$ip")
+  if (( ${#try_order[@]} > 1 )); then
+    # Spread instances across IPs using the profile and port as a seed.
+    old_random=$RANDOM
+    RANDOM=$(( (SOCKS_PORT * 9973 + ${#PROFILE_ID} * 17) % 32768 ))
+    for ((i=${#try_order[@]}-1; i>0; i--)); do
+      j=$((RANDOM % (i + 1)))
+      addr="${try_order[$i]}"
+      try_order[$i]="${try_order[$j]}"
+      try_order[$j]="$addr"
     done
-    rotated+=("$CURRENT_SOURCE_IP")
+    RANDOM=$old_random
+
+    # Retry the previous source last if it still exists in the refreshed pool.
+    for addr in "${try_order[@]}"; do
+      if [[ "$addr" == "$CURRENT_SOURCE_IP" ]]; then
+        previous_source="$addr"
+      else
+        rotated+=("$addr")
+      fi
+    done
+    [[ -z "$previous_source" ]] || rotated+=("$previous_source")
     try_order=("${rotated[@]}")
   fi
 
@@ -884,7 +876,7 @@ start_tunnel_with_source_rotation() {
     CURRENT_SOURCE_IP="${try_order[$i]}"
     build_ssh_opts
     start_ssh_bg
-    log "trying source=${CURRENT_SOURCE_IP} instance=$INSTANCE pid=$SSH_PID (${i+1}/${n})"
+    log "trying source=${CURRENT_SOURCE_IP} instance=$INSTANCE pid=$SSH_PID ($((i+1))/${n})"
     if wait_tunnel_ready; then
       log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=$CURRENT_SOURCE_IP"
       return 0
@@ -896,9 +888,11 @@ start_tunnel_with_source_rotation() {
   CURRENT_SOURCE_IP=""
   build_ssh_opts
   start_ssh_bg
-  log "fallback without BindAddress: instance=$INSTANCE pid=$SSH_PID"
+  if (( n > 0 )); then
+    log "fallback without BindAddress: instance=$INSTANCE pid=$SSH_PID"
+  fi
   if wait_tunnel_ready; then
-    log "tunnel started (no bind): profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID"
+    log "tunnel started: profile=${PROFILE_NAME:-$PROFILE_ID} instance=$INSTANCE pid=$SSH_PID source=default"
     return 0
   fi
   kill_ssh
@@ -948,7 +942,6 @@ while true; do
 
       if (( FAILS >= SOURCE_IP_FAILS_TO_SWITCH && ${#PUBLIC_IPS[@]} > 1 )); then
         warn "switching outbound source IP after ${FAILS} failures: instance=$INSTANCE was=${CURRENT_SOURCE_IP:-default}"
-        pick_source_ip "$CURRENT_SOURCE_IP"
         kill_ssh
         SWITCH_SOURCE=1
         break
@@ -974,8 +967,7 @@ while true; do
     SSH_PID=""
   fi
   if (( ${#PUBLIC_IPS[@]} > 1 )); then
-    pick_source_ip "$CURRENT_SOURCE_IP"
-    warn "ssh exited: instance=$INSTANCE; try next source=${CURRENT_SOURCE_IP:-default} in 2s"
+    warn "ssh exited: instance=$INSTANCE; trying another source IP in 2s"
   else
     warn "ssh exited: instance=$INSTANCE; restart in 2s"
   fi
@@ -1710,8 +1702,8 @@ create_or_update_profile_interactive() {
   prompt_default "Heartbeat every N checks" "${HEARTBEAT_EVERY:-20}" HEARTBEAT_EVERY
   prompt_yesno "Enable detailed health debug logs?" "${DEBUG_HEALTHCHECK:-NO}" DEBUG_HC
 
-  echo "  Outbound IP: auto-detect public IPv4s and rotate per tunnel (BindAddress)."
-  echo "  Set SOURCE_IP_MODE=none in the env file to disable; SOURCE_IPS=1.2.3.4,5.6.7.8 for manual list."
+  echo "  Outbound IP: auto-detect public IPs matching the SSH destination family and rotate per tunnel."
+  echo "  In the profile env file, set SOURCE_IP_MODE=none to disable, or SOURCE_IP_MODE=manual with a comma-separated SOURCE_IPS list."
   SOURCE_IP_MODE="${SOURCE_IP_MODE:-auto}"
   SOURCE_IPS="${SOURCE_IPS:-}"
   SOURCE_IP_REFRESH="${SOURCE_IP_REFRESH:-60}"
